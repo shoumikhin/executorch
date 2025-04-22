@@ -44,6 +44,24 @@
 
 cmake_minimum_required(VERSION 3.24)
 project(executorch)
+
+# MARK: - Start EXECUTORCH_H12025_BUILD_MIGRATION --------------------------------------------------
+
+include(${PROJECT_SOURCE_DIR}/tools/cmake/configuration_announcer.cmake)
+include(${PROJECT_SOURCE_DIR}/tools/cmake/platform/configuration.cmake)
+
+if(EXECUTORCH_PLATFORM_TARGET_TUPLE)
+  load_platform_configurations(${EXECUTORCH_PLATFORM_TARGET_TUPLE})
+else()
+  message(FATAL_ERROR "EXECUTORCH_PLATFORM_TARGET_TUPLE is not set")
+endif()
+
+# Print all the configs that were called with announce_configured_options.
+print_configured_options()
+
+# MARK: - End EXECUTORCH_H12025_BUILD_MIGRATION ----------------------------------------------------
+
+
 include(tools/cmake/Utils.cmake)
 include(CMakeDependentOption)
 

@@ -1,0 +1,42 @@
+{
+  "version": 10,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 31,
+    "patch": 0
+  },
+  "$comment": "On-device AI across mobile, embedded and edge for PyTorch.",
+  "configurePresets": [
+    {
+      "name": "common",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/cmake-out",
+      "generator": "Unix Makefiles"
+    },
+    {
+      "name": "host-tools",
+      "displayName": "Build tools for the host required for building ExecuTorch",
+      "inherits": ["common"]
+    },
+    {
+      "name": "macos-arm64",
+      "inherits": ["common"],
+      "cacheVariables": {
+        "EXECUTORCH_PLATFORM_TARGET_TUPLE": "macos-arm64",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/third-party/ios-cmake/ios.toolchain.cmake",
+        "PLATFORM": "MAC_ARM64",
+        "DEPLOYMENT_TARGET": "10.15"
+      }
+    },
+    {
+      "name": "ios-arm64",
+      "inherits": ["common"],
+      "cacheVariables": {
+        "EXECUTORCH_PLATFORM_TARGET_TUPLE": "ios-arm64",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/third-party/ios-cmake/ios.toolchain.cmake",
+        "PLATFORM": "OS64",
+        "DEPLOYMENT_TARGET": "17.0"
+      }
+    }
+  ]
+}
