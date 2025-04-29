@@ -19,16 +19,11 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 from executorch.backends.arm._passes import ArmPassManager
 
-from executorch.backends.arm.quantizer import arm_quantizer_utils
-from executorch.backends.arm.quantizer.arm_quantizer_utils import (  # type: ignore[attr-defined]
-    mark_node_as_annotated,
-)
-from executorch.backends.arm.quantizer.quantization_annotator import (  # type: ignore[import-not-found]
-    annotate_graph,
-)
-
-from executorch.backends.arm.quantizer.quantization_config import QuantizationConfig
+from executorch.backends.arm.quantizer import QuantizationConfig
 from executorch.backends.arm.tosa_specification import TosaSpecification
+
+from .arm_quantizer_utils import is_annotated, mark_node_as_annotated
+from .quantization_annotator import annotate_graph
 from executorch.backends.arm.arm_backend import (
     get_tosa_spec,
     is_ethosu,
@@ -286,10 +281,10 @@ class TOSAQuantizer(Quantizer):
         quantization_config: Optional[QuantizationConfig],
         filter_fn: Optional[Callable[[Node], bool]] = None,
     ) -> GraphModule:
-        """Loops over all STATIC_OPS and runs the corresponding registred annotator.
+        """Loops over all STATIC_OPS and runs the corresponding registered annotator.
         Args:
             model: The model to annotate statically.
-            quantization_config: Specifices the QuantizationSpecs for the model's
+            quantization_config: Specifies the QuantizationSpecs for the model's
                 input activations, output activations, weights and biases.
             filter_fn: An optional filter function that takes a node and returns whether the node should be annotated.
         Returns:
@@ -337,7 +332,7 @@ class TOSAQuantizer(Quantizer):
         quantization_config: QuantizationConfig,
     ):
         for node in model.graph.nodes:
-            if arm_quantizer_utils.is_annotated(node):
+            if is_annotated(node):
                 continue
             if node.op == "placeholder" and len(node.users) > 0:
                 _annotate_output_qspec(

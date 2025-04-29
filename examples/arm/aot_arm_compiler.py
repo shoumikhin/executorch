@@ -24,7 +24,7 @@ from executorch.backends.arm.arm_backend import (
     is_tosa,
 )
 from executorch.backends.arm.ethosu_partitioner import EthosUPartitioner
-from executorch.backends.arm.quantizer.arm_quantizer import (
+from executorch.backends.arm.quantizer import (
     EthosUQuantizer,
     get_symmetric_quantization_config,
     TOSAQuantizer,
@@ -466,7 +466,7 @@ def get_args():
         "--so_library",
         required=False,
         default=None,
-        help="Provide path to so library. E.g., cmake-out/examples/portable/custom_ops/libcustom_ops_aot_lib.so",
+        help="Provide path to custom .so library.",
     )
     parser.add_argument(
         "--debug", action="store_true", help="Set the logging level to debug."
@@ -508,12 +508,6 @@ def get_args():
 
     if args.debug:
         logging.basicConfig(level=logging.DEBUG, format=FORMAT, force=True)
-
-    if args.quantize and not args.so_library:
-        logging.warning(
-            "Quantization enabled without supplying path to libcustom_ops_aot_lib using -s flag."
-            + "This is required for running quantized models with unquantized input."
-        )
 
     # if we have custom ops, register them before processing the model
     if args.so_library is not None:
@@ -622,12 +616,28 @@ def save_bpte_program(exec_prog, original_model: torch.nn.Module, output_name: s
     save_bundled_program(exec_prog, method_test_suites, output_name)
 
 
-def to_edge_TOSA_delegate(
-    exported_program,
-    args,
-    model: torch.nn.Module,
+def quantize_model(
+    exported_program, args, model: torch.nn.Module, example_inputs, compile_spec
 ):
-    model_int8 = None
+    model_int8 = quantize(
+        model,
+        args.model_name,
+        compile_spec,
+        example_inputs,
+        args.evaluate,
+        args.evaluate_config,
+    )
+    # Wrap quantized model back into an exported_program
+    exported_program = torch.export.export_for_training(
+        model_int8, example_inputs, strict=True
+    )
+
+    return model_int8, exported_program
+
+
+def to_edge_TOSA_delegate(
+    exported_program, args, model: torch.nn.Module, example_inputs
+):
     # As we can target multiple output encodings, one must
     # be specified.
     compile_spec = get_compile_spec(
@@ -636,23 +646,13 @@ def to_edge_TOSA_delegate(
         args.system_config,
         args.memory_mode,
     )
-    if args.quantize:
-        model = quantize(
-            model,
-            args.model_name,
-            compile_spec,
-            example_inputs,
-            args.evaluate,
-            args.evaluate_config,
-        )
-        model_int8 = model
-        # Wrap quantized model back into an exported_program
-        exported_program = torch.export.export_for_training(
-            model, example_inputs, strict=True
-        )
 
-        if args.intermediates:
-            os.makedirs(args.intermediates, exist_ok=True)
+    model_int8 = None
+    if args.quantize:
+        model_int8, exported_program = quantize_model(
+            exported_program, args, model, example_inputs, compile_spec
+        )
+        model = model_int8
 
     if is_ethosu(compile_spec):
         partitioner = EthosUPartitioner(compile_spec)
@@ -664,6 +664,31 @@ def to_edge_TOSA_delegate(
     edge = to_edge_transform_and_lower(
         exported_program,
         partitioner=[partitioner],
+        compile_config=EdgeCompileConfig(
+            _check_ir_validity=False,
+        ),
+    )
+    return model_int8, edge
+
+
+def to_edge_no_delegate(exported_program, args, model: torch.nn.Module, example_inputs):
+    model_int8 = None
+    if args.quantize:
+        # As we can target multiple output encodings, one must
+        # be specified.
+        compile_spec = get_compile_spec(
+            args.target,
+            args.intermediates,
+            args.system_config,
+            args.memory_mode,
+        )
+        model, exported_program = quantize_model(
+            exported_program, args, model, example_inputs, compile_spec
+        )
+        model_int8 = model
+
+    edge = to_edge_transform_and_lower(
+        exported_program,
         compile_config=EdgeCompileConfig(
             _check_ir_validity=False,
         ),
@@ -688,16 +713,18 @@ if __name__ == "__main__":  # noqa: C901
     model = exported_program.module()
     model_fp32 = model
 
+    if args.intermediates:
+        os.makedirs(args.intermediates, exist_ok=True)
+
     # Quantize if required
     model_int8 = None
     if args.delegate:
-        model_int8, edge = to_edge_TOSA_delegate(exported_program, args, model)
+        model_int8, edge = to_edge_TOSA_delegate(
+            exported_program, args, model, example_inputs
+        )
     else:
-        edge = to_edge_transform_and_lower(
-            exported_program,
-            compile_config=EdgeCompileConfig(
-                _check_ir_validity=False,
-            ),
+        model_int8, edge = to_edge_no_delegate(
+            exported_program, args, model, example_inputs
         )
 
     dump_delegation_info(edge, args.intermediates)

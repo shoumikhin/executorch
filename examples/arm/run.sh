@@ -20,7 +20,9 @@ et_root_dir=$(realpath ${et_root_dir})
 model_name=""
 model_input_set=false
 model_input=""
-aot_arm_compiler_flags="--delegate --quantize"
+aot_arm_compiler_flag_delegate="--delegate"
+aot_arm_compiler_flag_quantize="--quantize"
+aot_arm_compiler_flags=""
 portable_kernels="aten::_softmax.out"
 target="ethos-u55-128"
 output_folder_set=false
@@ -41,7 +43,9 @@ function help() {
     echo "  --model_name=<MODEL>                   Model file .py/.pth/.pt, builtin model or a model from examples/models. Passed to aot_arm_compiler"
     echo "  --model_input=<INPUT>                  Provide model input .pt file to override the input in the model file. Passed to aot_arm_compiler"
     echo "                                           NOTE: Inference in FVP is done with a dummy input full of ones. Use bundleio flag to run the model in FVP with the custom input or the input from the model file."
-    echo "  --aot_arm_compiler_flags=<FLAGS>       Only used if --model_name is used Default: ${aot_arm_compiler_flags}"
+    echo "  --aot_arm_compiler_flags=<FLAGS>       Extra flags to pass to aot compiler"
+    echo "  --no_delegate                          Do not delegate the model (can't override builtin models)"
+    echo "  --no_quantize                          Do not quantize the model (can't override builtin models)"
     echo "  --portable_kernels=<OPS>               Comma separated list of portable (non delagated) kernels to include Default: ${portable_kernels}"
     echo "  --target=<TARGET>                      Target to build and run for Default: ${target}"
     echo "  --output=<FOLDER>                      Target build output folder Default: ${output_folder}"
@@ -64,6 +68,8 @@ for arg in "$@"; do
       --model_name=*) model_name="${arg#*=}";;
       --model_input=*) model_input="${arg#*=}" ; model_input_set=true  ;;
       --aot_arm_compiler_flags=*) aot_arm_compiler_flags="${arg#*=}";;
+      --no_delegate) aot_arm_compiler_flag_delegate="" ;;
+      --no_quantize) aot_arm_compiler_flag_quantize="" ;;
       --portable_kernels=*) portable_kernels="${arg#*=}";;
       --target=*) target="${arg#*=}";;
       --output=*) output_folder="${arg#*=}" ; output_folder_set=true ;;
@@ -146,21 +152,13 @@ fi
 backends/arm/scripts/build_executorch.sh --et_build_root="${et_build_root}" --build_type=$build_type $devtools_flag
 backends/arm/scripts/build_portable_kernels.sh --et_build_root="${et_build_root}" --build_type=$build_type --portable_kernels=$portable_kernels
 
-# Build a lib quantized_ops_aot_lib
-backends/arm/scripts/build_quantized_ops_aot_lib.sh --et_build_root="${et_build_root}" --build_type=$build_type
-
-SO_EXT=$(python3 -c 'import platform; print({"Darwin": "dylib", "Linux": "so", "Windows": "dll"}.get(platform.system(), None))')
-# We are using the aot_lib from build_quantization_aot_lib below
-SO_LIB=$(find "${et_build_root}/cmake-out-aot-lib" -name libquantized_ops_aot_lib.${SO_EXT})
-
-
 if [[ -z "$model_name" ]]; then
     # the test models run, and whether to delegate
     test_model=( "softmax" "add" "add3" "mv2" )
     model_compiler_flags=( "" "--delegate" "--delegate" "--delegate --quantize" )
 else
     test_model=( "$model_name" )
-    model_compiler_flags=( "$aot_arm_compiler_flags" )
+    model_compiler_flags=( "$aot_arm_compiler_flag_delegate $aot_arm_compiler_flag_quantize $aot_arm_compiler_flags" )
 fi
 
 # loop over running the AoT flow and executing the model on device
@@ -205,7 +203,7 @@ for i in "${!test_model[@]}"; do
         model_compiler_flags="${model_compiler_flags} --model_input=${model_input}"
     fi
 
-    ARM_AOT_CMD="python3 -m examples.arm.aot_arm_compiler --model_name=${model} --target=${target} ${model_compiler_flags} --intermediate=${output_folder} --output=${pte_file} --so_library=$SO_LIB --system_config=${system_config} --memory_mode=${memory_mode} $bundleio_flag"
+    ARM_AOT_CMD="python3 -m examples.arm.aot_arm_compiler --model_name=${model} --target=${target} ${model_compiler_flags} --intermediate=${output_folder} --output=${pte_file} --system_config=${system_config} --memory_mode=${memory_mode} $bundleio_flag"
     echo "CALL ${ARM_AOT_CMD}" >&2
     ${ARM_AOT_CMD} 1>&2
 
@@ -220,7 +218,7 @@ for i in "${!test_model[@]}"; do
     else
         set -x
         # Rebuild the application as the pte is imported as a header/c array
-        backends/arm/scripts/build_executorch_runner.sh --et_build_root="${et_build_root}" --pte="${pte_file}" --build_type=${build_type} --target=${target} --system_config=${system_config} --memory_mode=${memory_mode} ${bundleio_flag} ${et_dump_flag} --extra_build_flags="${extra_build_flags}" --ethosu_tools_dir="${ethos_u_scratch_dir}"
+        backends/arm/scripts/build_executor_runner.sh --et_build_root="${et_build_root}" --pte="${pte_file}" --build_type=${build_type} --target=${target} --system_config=${system_config} --memory_mode=${memory_mode} ${bundleio_flag} ${et_dump_flag} --extra_build_flags="${extra_build_flags}" --ethosu_tools_dir="${ethos_u_scratch_dir}"
         if [ "$build_only" = false ] ; then
             # Execute the executor_runner on FVP Simulator
             elf_file="${output_folder}/${elf_folder}/cmake-out/arm_executor_runner"
