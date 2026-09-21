@@ -422,6 +422,24 @@ bool MethodMeta::uses_backend(const char* backend_name) const {
   return false;
 }
 
+Result<bool> MethodMeta::output_is_input(size_t index) const {
+  auto num_outputs = this->num_outputs();
+  ET_CHECK_OR_RETURN_ERROR(
+      index < num_outputs,
+      InvalidArgument,
+      "index %zu out of range. num_outputs: %zu",
+      index,
+      num_outputs);
+  const auto output_index = s_plan_->outputs()->Get(index);
+  const auto* inputs = s_plan_->inputs();
+  for (size_t i = 0; i < inputs->size(); ++i) {
+    if (inputs->Get(i) == output_index) {
+      return true;
+    }
+  }
+  return false;
+}
+
 size_t MethodMeta::num_backends() const {
   const auto delegates = s_plan_->delegates();
   return delegates ? delegates->size() : 0;

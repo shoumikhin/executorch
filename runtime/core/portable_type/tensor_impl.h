@@ -173,9 +173,23 @@ class TensorImpl {
     return ArrayRef<DimOrderType>{dim_order_, static_cast<size_t>(dim_)};
   }
 
+  /// Returns true if the tensor was constructed with a dim order. Callers must
+  /// ask before calling dim_order(), which builds a view over a null pointer
+  /// when it was not.
+  bool has_dim_order() const {
+    return dim_order_ != nullptr;
+  }
+
   /// Returns the strides of the tensor at each dimension.
   const ArrayRef<StridesType> strides() const {
     return ArrayRef<StridesType>{strides_, static_cast<size_t>(dim_)};
+  }
+
+  /// Returns true if the tensor was constructed with strides. Callers must ask
+  /// before calling strides(), which builds a view over a null pointer when it
+  /// was not.
+  bool has_strides() const {
+    return strides_ != nullptr;
   }
 
   /// Returns the mutability of the shape of the tensor.

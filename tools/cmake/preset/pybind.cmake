@@ -39,6 +39,16 @@ if(DEFINED ENV{EXECUTORCH_PYBIND_ENABLE_VGF})
   endif()
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  if(NOT EXECUTORCH_BUILD_PYBIND_WITHOUT_TORCH)
+    set_overridable_option(EXECUTORCH_BUILD_EXTENSION_TRAINING ON)
+  endif()
+  if(NOT EXECUTORCH_BUILD_PYBIND_WITHOUT_TORCH)
+    set_overridable_option(EXECUTORCH_BUILD_EXTENSION_LLM_RUNNER ON)
+    set_overridable_option(EXECUTORCH_BUILD_EXTENSION_LLM ON)
+  endif()
+endif()
+
 # TODO(larryliu0820): Temporarily disable building llm_runner for Windows wheel
 # due to the issue of tokenizer file path length limitation.
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -56,9 +66,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   set_overridable_option(EXECUTORCH_BUILD_SHARED ON)
   set_overridable_option(EXECUTORCH_BUILD_VGF ${_executorch_pybind_enable_vgf})
   set_overridable_option(EXECUTORCH_BUILD_COREML ON)
-  set_overridable_option(EXECUTORCH_BUILD_EXTENSION_TRAINING ON)
-  set_overridable_option(EXECUTORCH_BUILD_EXTENSION_LLM_RUNNER ON)
-  set_overridable_option(EXECUTORCH_BUILD_EXTENSION_LLM ON)
   # MLX needs the Metal compiler (xcrun -sdk macosx metal), which comes with
   # Xcode and not with the Command Line Tools, so it is probed rather than
   # assumed. The TorchAO kernels are enabled for aarch64 here and under Linux
@@ -86,9 +93,6 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
   set_overridable_option(EXECUTORCH_BUILD_VGF ${_executorch_pybind_enable_vgf})
   set_overridable_option(EXECUTORCH_BUILD_COREML ON)
-  set_overridable_option(EXECUTORCH_BUILD_EXTENSION_TRAINING ON)
-  set_overridable_option(EXECUTORCH_BUILD_EXTENSION_LLM_RUNNER ON)
-  set_overridable_option(EXECUTORCH_BUILD_EXTENSION_LLM ON)
   # The same kernels the macOS arm64 wheel gets above, because the processor is
   # what decides whether they can run, not the operating system. Off for x86
   # because the build sets TORCHAO_BUILD_CPU_AARCH64, which compiles an

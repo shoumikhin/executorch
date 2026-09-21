@@ -274,6 +274,36 @@ TEST_F(TensorImplTest, TestSetSizesContigUnbounded) {
   EXPECT_NE(err, Error::Ok);
 }
 
+TEST_F(TensorImplTest, TestHasStridesAndHasDimOrder) {
+  // Both default to null and are stored as given, so a tensor can state its
+  // layout with either, with both, or with neither. Reading an accessor whose
+  // pointer is null builds a view over it, so a caller that wants to know has
+  // to ask first.
+  SizesType sizes[2] = {3, 2};
+  DimOrderType dim_order[2] = {0, 1};
+  StridesType strides[2] = {2, 1};
+  float data[6] = {0};
+
+  TensorImpl neither(ScalarType::Float, 2, sizes, data);
+  EXPECT_FALSE(neither.has_dim_order());
+  EXPECT_FALSE(neither.has_strides());
+
+  TensorImpl order_only(ScalarType::Float, 2, sizes, data, dim_order);
+  EXPECT_TRUE(order_only.has_dim_order());
+  EXPECT_FALSE(order_only.has_strides());
+
+  TensorImpl strides_only(
+      ScalarType::Float, 2, sizes, data, /*dim_order=*/nullptr, strides);
+  EXPECT_FALSE(strides_only.has_dim_order());
+  EXPECT_TRUE(strides_only.has_strides());
+
+  TensorImpl both(ScalarType::Float, 2, sizes, data, dim_order, strides);
+  EXPECT_TRUE(both.has_dim_order());
+  EXPECT_TRUE(both.has_strides());
+  EXPECT_EQ(both.dim_order().data(), dim_order);
+  EXPECT_EQ(both.strides().data(), strides);
+}
+
 TEST_F(TensorImplTest, TestDynamicTensorNoStridesDimOrder) {
   SizesType sizes[3] = {2, 3, 4};
   float data[24] = {0};

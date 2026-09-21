@@ -18,18 +18,44 @@ import os
 import sys
 import warnings as _warnings
 
-import executorch.exir._warnings as _exir_warnings
-
+# Importing exir requires torch. Reuse its warning category only if already loaded;
+# otherwise use its base class. Filters for ExperimentalWarning alone will not match.
+_category = DeprecationWarning
+if "executorch.exir._warnings" in sys.modules:
+    _category = sys.modules["executorch.exir._warnings"].ExperimentalWarning
 _warnings.warn(
-    "This API is experimental and subject to change without notice.",
-    _exir_warnings.ExperimentalWarning,
+    "This API is experimental and subject to change without notice.", _category
 )
 
-# When installed as a pip wheel, we must import `torch` before trying to import
-# the pybindings shared library extension. This will load libtorch.so and
-# related libs, ensuring that the pybindings lib can resolve those runtime
-# dependencies.
-import torch as _torch
+# When installed as a pip wheel, the extension needs libtorch loaded before it
+# can resolve its own dependencies, and importing torch is what loads it. An
+# extension built without the torch tensor path links no libtorch and must not
+# pay for that import, so the extension is tried first and torch is only brought
+# in if it turns out to be needed.
+_extension_error = None
+try:
+    from executorch.extension.pybindings import _C
+
+    # An extension built before this flag existed does not report it. Assume the
+    # old answer, which is that it needs torch, rather than failing the import.
+    _needs_torch = getattr(_C, "_links_torch", True)
+except ImportError as _error:
+    # libtorch is what the extension could not resolve, and importing torch loads
+    # it. Any other cause lands here too, and this is the only error that says what
+    # it was, so keep it rather than let a message about torch replace it.
+    _extension_error = _error
+    _needs_torch = True
+
+if _needs_torch:
+    try:
+        # Torch's tensor converters need its Python types registered before use.
+        import torch as _torch  # noqa: F401
+
+        from executorch.extension.pybindings import _C
+    except ImportError as _error:
+        raise _error from _extension_error
+
+_links_torch = getattr(_C, "_links_torch", True)
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +132,6 @@ from executorch.extension.pybindings._C import (  # noqa: F401
 
 # Clean up so that `dir(portable_lib)` is the same as `dir(_C)`
 # (apart from some __dunder__ names).
-del _torch
-del _exir_warnings
-del _warnings
+if "_torch" in globals():
+    del _torch
+del _category, _extension_error, _needs_torch, _warnings

@@ -109,8 +109,9 @@ if(BUILD_TESTING)
   add_subdirectory(test)
 endif()
 
-# Python bindings for MultimodalRunner
-if(EXECUTORCH_BUILD_PYBIND)
+# Python bindings for MultimodalRunner. These read torch tensors in C++ and link
+# torch, so they are not part of a build that leaves torch out.
+if(EXECUTORCH_BUILD_PYBIND AND NOT EXECUTORCH_BUILD_PYBIND_WITHOUT_TORCH)
   # Create the Python extension module for LLM runners
   pybind11_add_module(
     _llm_runner SHARED ${CMAKE_CURRENT_SOURCE_DIR}/pybindings.cpp

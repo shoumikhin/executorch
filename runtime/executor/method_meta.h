@@ -257,6 +257,18 @@ class MethodMeta final {
   bool uses_backend(const char* backend_name) const;
 
   /**
+   * Whether the output at the given index is also one of the method's inputs,
+   * which happens when a method returns an input unchanged. Such an output
+   * shares its memory with that input, so giving it a buffer of its own would
+   * move the input as well.
+   *
+   * @param[in] index The index of the output.
+   * @returns A Result wrapping true when the output is also an input, or an
+   * error if the index is invalid.
+   */
+  Result<bool> output_is_input(size_t index) const;
+
+  /**
    * Get the number of backends used in this method.
    *
    * @returns The total number of backend names.

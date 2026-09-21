@@ -41,14 +41,14 @@ fbcode_target(_kind = runtime.genrule,
 )
 
 fbcode_target(_kind = executorch_pybindings,
-    cppdeps = PORTABLE_MODULE_DEPS,
+    cppdeps = PORTABLE_MODULE_DEPS + [":dlpack"],
     python_module_name = "core",
     types = ["//executorch/extension/pybindings:pybindings_types_gen[core.pyi]"],
     visibility = ["PUBLIC"],
 )
 
 fbcode_target(_kind = executorch_pybindings,
-    cppdeps = PORTABLE_MODULE_DEPS + MODELS_ATEN_OPS_LEAN_MODE_GENERATED_LIB,
+    cppdeps = PORTABLE_MODULE_DEPS + MODELS_ATEN_OPS_LEAN_MODE_GENERATED_LIB + [":dlpack"],
     # Give this an underscore prefix because it has a pure python wrapper.
     python_module_name = "_C",
     types = ["//executorch/extension/pybindings:pybindings_types_gen[_C.pyi]"],
@@ -56,7 +56,7 @@ fbcode_target(_kind = executorch_pybindings,
 )
 
 fbcode_target(_kind = executorch_pybindings,
-    cppdeps = ATEN_MODULE_DEPS + MODELS_ATEN_OPS_ATEN_MODE_GENERATED_LIB,
+    cppdeps = ATEN_MODULE_DEPS + MODELS_ATEN_OPS_ATEN_MODE_GENERATED_LIB + [":dlpack"],
     python_module_name = "aten_lib",
     types = ["//executorch/extension/pybindings:pybindings_types_gen[aten_lib.pyi]"],
     visibility = ["PUBLIC"],
@@ -83,6 +83,15 @@ fbcode_target(
         "//executorch/runtime/core:core",
     ],
     visibility = ["PUBLIC"],
+)
+
+# The part of the DLPack ABI pybindings.cpp uses to pass memory in and out of
+# Python. Anything that compiles pybindings.cpp needs this header.
+fbcode_target(
+    _kind = cpp_library,
+    name = "dlpack",
+    headers = ["dlpack.h"],
+    visibility = ["//executorch/extension/pybindings/..."],
 )
 
 # Python extension that registers the PyDataLoader type.
