@@ -111,6 +111,53 @@ void check_tensor(const TensorInfo& tensor_info) {
   EXPECT_EQ(tensor_info.is_memory_planned(), true);
   EXPECT_EQ(tensor_info.nbytes(), 16);
 }
+
+// A program holding one method that names the given values as its inputs and
+// outputs, for the cases no exported model in this test's inventory covers.
+std::vector<uint8_t> make_program(
+    const std::vector<int32_t>& inputs,
+    const std::vector<int32_t>& outputs) {
+  flatbuffers::FlatBufferBuilder fbb;
+  std::vector<int64_t> non_const_buffer_sizes = {0};
+  auto plan = executorch_flatbuffer::CreateExecutionPlanDirect(
+      fbb,
+      /*name=*/"forward",
+      /*container_meta_type=*/0,
+      /*values=*/nullptr,
+      /*inputs=*/&inputs,
+      /*outputs=*/&outputs,
+      /*chains=*/nullptr,
+      /*operators=*/nullptr,
+      /*delegates=*/nullptr,
+      /*non_const_buffer_sizes=*/&non_const_buffer_sizes,
+      /*non_const_buffer_device=*/nullptr);
+  std::vector<flatbuffers::Offset<executorch_flatbuffer::ExecutionPlan>> plans =
+      {plan};
+
+  auto const_offsets = fbb.CreateVector(std::vector<uint64_t>{0});
+  auto constant_segment = executorch_flatbuffer::CreateSubsegmentOffsets(
+      fbb, /*segment_index=*/0, const_offsets);
+  std::vector<flatbuffers::Offset<executorch_flatbuffer::DataSegment>>
+      segments = {executorch_flatbuffer::CreateDataSegment(
+          fbb, /*offset=*/0, /*size=*/0)};
+
+  auto program = executorch_flatbuffer::CreateProgramDirect(
+      fbb,
+      /*version=*/Program::kMaxSupportedSchemaVersion,
+      /*execution_plan=*/&plans,
+      /*constant_buffer=*/nullptr,
+      /*backend_delegate_data=*/nullptr,
+      /*segments=*/&segments,
+      /*constant_segment=*/constant_segment);
+  executorch_flatbuffer::FinishProgramBuffer(fbb, program);
+
+  std::vector<uint8_t> buffer(
+      fbb.GetBufferPointer(), fbb.GetBufferPointer() + fbb.GetSize());
+  if (buffer.size() < Program::kMinHeadBytes) {
+    buffer.resize(Program::kMinHeadBytes, 0);
+  }
+  return buffer;
+}
 } // namespace
 
 TEST_F(MethodMetaTest, MethodMetaApi) {
@@ -146,6 +193,41 @@ TEST_F(MethodMetaTest, MethodMetaApi) {
   EXPECT_EQ(
       programs_["add"]->method_meta("not_a_method").error(),
       Error::InvalidArgument);
+}
+
+TEST_F(MethodMetaTest, OutputIsInput) {
+  Result<MethodMeta> method_meta = programs_["add"]->method_meta("forward");
+  ASSERT_EQ(method_meta.error(), Error::Ok);
+
+  // This method computes its output, so the output is not one of its inputs.
+  const auto is_input = method_meta->output_is_input(0);
+  ASSERT_EQ(is_input.error(), Error::Ok);
+  EXPECT_FALSE(is_input.get());
+
+  EXPECT_EQ(method_meta->output_is_input(1).error(), Error::InvalidArgument);
+}
+
+TEST_F(MethodMetaTest, OutputIsInputWhenAMethodReturnsAnInput) {
+  // No model in this test's inventory returns an input unchanged, and only such
+  // a method can tell a true answer from an implementation that always says no.
+  // Value 1 is both the second input and the first output. Value 2 is an output
+  // that no input names.
+  std::vector<uint8_t> buffer =
+      make_program(/*inputs=*/{0, 1}, /*outputs=*/{1, 2});
+  BufferDataLoader loader(buffer.data(), buffer.size());
+  Result<Program> prog = Program::load(&loader, Program::Verification::Minimal);
+  ASSERT_EQ(prog.error(), Error::Ok);
+
+  Result<MethodMeta> method_meta = prog->method_meta("forward");
+  ASSERT_EQ(method_meta.error(), Error::Ok);
+
+  const auto returned_input = method_meta->output_is_input(0);
+  ASSERT_EQ(returned_input.error(), Error::Ok);
+  EXPECT_TRUE(returned_input.get());
+
+  const auto computed = method_meta->output_is_input(1);
+  ASSERT_EQ(computed.error(), Error::Ok);
+  EXPECT_FALSE(computed.get());
 }
 
 TEST_F(MethodMetaTest, TensorInfoApi) {
@@ -286,48 +368,7 @@ TEST_F(MethodMetaTest, MethodMetaBufferDeviceReturnsCudaForDeviceBuffer) {
 TEST_F(MethodMetaTest, UsesBackendOnUnsetDelegatesReturnsFalse) {
   // Construct a minimal schema-valid FlatBuffer program where delegates is
   // unset (nullptr).
-  flatbuffers::FlatBufferBuilder fbb;
-  std::vector<int32_t> empty_inputs = {};
-  std::vector<int32_t> empty_outputs = {};
-  std::vector<int64_t> non_const_buffer_sizes = {0};
-  auto plan = executorch_flatbuffer::CreateExecutionPlanDirect(
-      fbb,
-      /*name=*/"forward",
-      /*container_meta_type=*/0,
-      /*values=*/nullptr,
-      /*inputs=*/&empty_inputs,
-      /*outputs=*/&empty_outputs,
-      /*chains=*/nullptr,
-      /*operators=*/nullptr,
-      /*delegates=*/nullptr,
-      /*non_const_buffer_sizes=*/&non_const_buffer_sizes,
-      /*non_const_buffer_device=*/nullptr);
-  std::vector<flatbuffers::Offset<executorch_flatbuffer::ExecutionPlan>> plans =
-      {plan};
-
-  auto const_offsets = fbb.CreateVector(std::vector<uint64_t>{0});
-  auto constant_segment = executorch_flatbuffer::CreateSubsegmentOffsets(
-      fbb, /*segment_index=*/0, const_offsets);
-  std::vector<flatbuffers::Offset<executorch_flatbuffer::DataSegment>>
-      segments = {executorch_flatbuffer::CreateDataSegment(
-          fbb, /*offset=*/0, /*size=*/0)};
-
-  auto program = executorch_flatbuffer::CreateProgramDirect(
-      fbb,
-      /*version=*/Program::kMaxSupportedSchemaVersion,
-      /*execution_plan=*/&plans,
-      /*constant_buffer=*/nullptr,
-      /*backend_delegate_data=*/nullptr,
-      /*segments=*/&segments,
-      /*constant_segment=*/constant_segment);
-  executorch_flatbuffer::FinishProgramBuffer(fbb, program);
-
-  std::vector<uint8_t> buffer(
-      fbb.GetBufferPointer(), fbb.GetBufferPointer() + fbb.GetSize());
-  if (buffer.size() < Program::kMinHeadBytes) {
-    buffer.resize(Program::kMinHeadBytes, 0);
-  }
-
+  std::vector<uint8_t> buffer = make_program(/*inputs=*/{}, /*outputs=*/{});
   BufferDataLoader loader(buffer.data(), buffer.size());
   Result<Program> prog = Program::load(&loader, Program::Verification::Minimal);
   ASSERT_EQ(prog.error(), Error::Ok);

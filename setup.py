@@ -2071,17 +2071,38 @@ class CustomBuildPy(build_py):
     a file to a different relative location under the output package directory.
     """
 
-    def _prune_unstaged_files(self) -> None:
-        """Delete .py and .yaml this command staged in an earlier build and no longer wants.
+    def _drop_training_package_if_disabled(self) -> None:
+        """Removes the staged training package when its native half was not built.
 
-        Restricted to files that exist in the source tree, because build_py is the first of
-        build's sub commands and everything a later one stages is still sitting in the build
-        directory when this runs. build_ext generates executorch/data/bin/__init__.py, the
+        That package imports the native library unconditionally, so shipping it
+        without the library gives an ImportError on first use rather than a clear
+        message that training was disabled.
+        """
+        cmake_cache_dir = getattr(
+            self.get_finalized_command("build"), "cmake_cache_dir", None
+        )
+        if not cmake_cache_dir:
+            return
+        cache = CMakeCache(cache_path=os.path.join(cmake_cache_dir, "CMakeCache.txt"))
+        if cache.is_enabled("EXECUTORCH_BUILD_EXTENSION_TRAINING"):
+            return
+        # Stale binaries from an earlier build with training on go too.
+        training_dir = Path(self.build_lib) / "executorch" / "extension" / "training"
+        if training_dir.is_dir():
+            shutil.rmtree(training_dir)
+
+    def _prune_unstaged_files(self) -> None:
+        """Remove disabled training and obsolete .py/.yaml files from staging.
+
+        Outside the disabled training package, restrict cleanup to source files: later
+        build subcommands may have left generated outputs in the build directory.
+        build_ext generates executorch/data/bin/__init__.py, the
         target of the flatc console script, from a template that lives elsewhere, so a walk
         that removed anything absent from build_py's own file list would delete it.
         """
         if self.editable_mode:
             return
+        self._drop_training_package_if_disabled()
         if not self.packages:
             # Nothing to compare against, so every staged file would look unwanted. Refuse
             # rather than empty the build directory.

@@ -69,13 +69,16 @@ ET_CHECK_MSG(
         ssize_t(a.size(i)),
         ssize_t(b.size(i)));
   }
-  // check strides and dim order
+  // check strides and dim order. A tensor with no elements has nothing laid
+  // out, so the strides it reports need not be the ones its dim order implies,
+  // and comparing them would refuse a layout that cannot be wrong. Its dtype
+  // still is compared, below.
   std::array<exec_aten::StridesType, executorch::runtime::kTensorDimensionLimit>
       expected_strides{};
   runtime::dim_order_to_stride_nocheck(
       b.sizes().data(), b.dim_order().data(), b.dim(), expected_strides.data());
 
-  for (size_t i = 0, dims = a.dim(); i < dims; ++i) {
+  for (size_t i = 0, dims = b.numel() == 0 ? 0 : a.dim(); i < dims; ++i) {
     // Dont match strides if the size is 1.
     // Why? Because tensor is non-contig only if
     // strides dont match product(sizes[i:]) when size(i) > 1
@@ -149,9 +152,12 @@ c10::ScalarType executorch_to_torch_scalar_type(
 void alias_etensor_to_attensor(
     at::Tensor& aten_tensor,
     torch::executor::Tensor& mutable_et) {
+  // Channels-last is a layout the runtime describes at four and five
+  // dimensions, and torch spells the five dimensional one as its own format.
   ET_CHECK_MSG(
       aten_tensor.is_contiguous() ||
-          aten_tensor.is_contiguous(at::MemoryFormat::ChannelsLast),
+          aten_tensor.is_contiguous(at::MemoryFormat::ChannelsLast) ||
+          aten_tensor.is_contiguous(at::MemoryFormat::ChannelsLast3d),
       "Input tensor must have contiguous or channels last memory format");
 
   check_tensor_meta(aten_tensor, mutable_et);

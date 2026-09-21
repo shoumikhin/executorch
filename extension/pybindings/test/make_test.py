@@ -14,6 +14,19 @@ from executorch.exir.backend.partitioner import Partitioner
 from torch.export import export
 
 
+class ModuleAddInPlace(torch.nn.Module):
+    """A module that writes into the memory of its first input."""
+
+    def forward(self, x, y):
+        return x.add_(y)
+
+    def get_methods_to_export(self):
+        return ("forward",)
+
+    def get_inputs(self):
+        return (torch.ones(2, 2), torch.ones(2, 2))
+
+
 class ModuleAdd(torch.nn.Module):
     """The module to serialize and execute."""
 
@@ -62,6 +75,38 @@ class ModuleChannelsLastInDefaultOut(torch.nn.Module):
 
     def get_inputs(self):
         return (torch.ones(1, 2, 3, 4).to(memory_format=torch.channels_last),)
+
+
+class ModuleScale4d(torch.nn.Module):
+    """A four dimensional module exported with the default memory layout."""
+
+    def forward(self, x):
+        return x * 2.0
+
+    def get_methods_to_export(self):
+        return ("forward",)
+
+    def get_inputs(self):
+        return (torch.arange(24, dtype=torch.float32).reshape(1, 2, 3, 4),)
+
+
+class ModuleAddDtype(torch.nn.Module):
+    """ModuleAdd for a chosen dtype, so a caller can check that an input's dtype
+    is read as the one the method was exported with."""
+
+    def __init__(self, dtype: torch.dtype):
+        super().__init__()
+        self._dtype = dtype
+
+    def forward(self, x, y):
+        return x + y
+
+    def get_methods_to_export(self):
+        return ("forward",)
+
+    def get_inputs(self):
+        ones = torch.ones(2, 3, dtype=self._dtype)
+        return (ones, ones)
 
 
 class ModuleMulti(torch.nn.Module):

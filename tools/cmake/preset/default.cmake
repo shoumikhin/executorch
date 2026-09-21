@@ -141,6 +141,22 @@ define_overridable_option(
 define_overridable_option(
   EXECUTORCH_BUILD_PYBIND "Build the Python Bindings" BOOL OFF
 )
+#[[
+WITHOUT_TORCH removes binding linkage, not build-time dependencies.
+Related EXECUTORCH_BUILD_ options | Behavior with WITHOUT_TORCH=ON
+PYBIND                           | Required
+EXTENSION_TRAINING               | Rejected: bindings require libtorch
+EXTENSION_LLM / LLM_RUNNER        | Off by default in pybind preset
+KERNELS_* / CUDA / ROCM / METAL   | Keep their own torch requirements
+Build environment                | Still needs torch headers and torchgen
+Training Python package          | Omitted when training is not built
+LLM runner Python module         | Omitted: requires libtorch
+Single-input calls               | Supported through generic input conversion
+]]
+define_overridable_option(
+  EXECUTORCH_BUILD_PYBIND_WITHOUT_TORCH
+  "Build Python bindings without linking libtorch" BOOL OFF
+)
 define_overridable_option(
   EXECUTORCH_BUILD_QNN "Build the Qualcomm backend" BOOL OFF
 )
@@ -427,6 +443,21 @@ check_required_options_on(
 check_required_options_on(
   IF_ON EXECUTORCH_BUILD_PYBIND REQUIRES EXECUTORCH_BUILD_EXTENSION_MODULE
 )
+
+check_required_options_on(
+  IF_ON EXECUTORCH_BUILD_PYBIND_WITHOUT_TORCH REQUIRES EXECUTORCH_BUILD_PYBIND
+)
+
+if(EXECUTORCH_BUILD_PYBIND_WITHOUT_TORCH
+   AND EXECUTORCH_BUILD_EXTENSION_TRAINING
+)
+  message(
+    FATAL_ERROR
+      "EXECUTORCH_BUILD_EXTENSION_TRAINING=ON is incompatible with "
+      "EXECUTORCH_BUILD_PYBIND_WITHOUT_TORCH=ON because the training bindings require libtorch. "
+      "Set EXECUTORCH_BUILD_EXTENSION_TRAINING=OFF or EXECUTORCH_BUILD_PYBIND_WITHOUT_TORCH=OFF."
+  )
+endif()
 
 check_required_options_on(
   IF_ON EXECUTORCH_BUILD_KERNELS_LLM REQUIRES
