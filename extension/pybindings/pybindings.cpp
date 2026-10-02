@@ -15,7 +15,6 @@
 #include <stdexcept>
 #include <thread>
 
-#include <pybind11/iostream.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -3323,9 +3322,10 @@ py::bool_ is_available(const std::string& backend_name) {
 } // namespace
 
 PYBIND11_MODULE(EXECUTORCH_PYTHON_MODULE_NAME, m) {
-  // Redirects cout and cerr for function calls this guards to the python env.
-  auto call_guard = py::
-      call_guard<py::scoped_ostream_redirect, py::scoped_estream_redirect>();
+  // pybind11's scoped ostream redirect swaps the process-wide std::cout and
+  // std::cerr buffers and is not thread safe once a binding releases the GIL,
+  // so calls run unredirected and logs go to sys.stderr through the PAL below.
+  auto call_guard = py::call_guard<>();
 
   // Bind the verification enum to python.
   py::enum_<Program::Verification>(m, "Verification")
@@ -3602,19 +3602,27 @@ PYBIND11_MODULE(EXECUTORCH_PYTHON_MODULE_NAME, m) {
 
 namespace {
 
-// Our logs work by writing to stderr. By default this is done through fprintf
-// (as defined in posix.cpp) which then does not show up in python environments.
-// Here we override the pal to use std::cerr which can be properly redirected by
-// scoped_estream_redirect.
+// Forwards runtime logs to Python's current sys.stderr, so they show up in
+// notebooks and captured output, without touching the process-wide std::cerr.
 void emit_log_message(
-    et_timestamp_t timestamp,
-    et_pal_log_level_t level,
+    ET_UNUSED et_timestamp_t timestamp,
+    ET_UNUSED et_pal_log_level_t level,
     const char* filename,
     ET_UNUSED const char* function,
     size_t line,
     const char* message,
-    ET_UNUSED size_t length) {
-  std::cerr << "[" << filename << ":" << line << "] " << message << std::endl;
+    size_t length) {
+  const std::string formatted = "[" + std::string(filename) + ":" +
+      std::to_string(line) + "] " + std::string(message, length) + "\n";
+  if (Py_IsInitialized()) {
+    try {
+      py::gil_scoped_acquire gil;
+      py::module_::import("sys").attr("stderr").attr("write")(formatted);
+      return;
+    } catch (py::error_already_set&) {
+    }
+  }
+  std::cerr << formatted << std::flush;
 }
 
 runtime::PalImpl build_pal() {

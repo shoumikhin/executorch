@@ -197,6 +197,48 @@ _HOSTILE_CAPSULE = textwrap.dedent(
     """
 )
 
+# Several threads each running their own method, with torch tensors as inputs.
+# The torch adapter calls into Python while converting an input, so threads take
+# turns inside the bindings. Anything those calls share across threads breaks
+# here, and when it breaks it ends the process rather than raising.
+_THREADED_TORCH_CALLS = textwrap.dedent(
+    """\
+    import sys
+    import threading
+
+    import torch
+    from executorch.extension.pybindings import portable_lib as runtime
+
+    with open(sys.argv[1], "rb") as pte:
+        data = pte.read()
+    program = runtime._load_program_from_buffer(data)
+    barrier = threading.Barrier(8)
+    errors = []
+
+
+    def run(method):
+        inputs = (torch.ones(2, 2), torch.ones(2, 2))
+        barrier.wait()
+        try:
+            for _ in range(200):
+                output = method(inputs)[0]
+                assert torch.equal(torch.as_tensor(output), inputs[0] + inputs[1])
+        except BaseException as error:
+            errors.append(repr(error))
+
+
+    threads = [
+        threading.Thread(target=run, args=(program.load_method("forward"),))
+        for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    print(errors[0] if errors else "ran")
+    """
+)
+
 
 class _OnlyDlpack:
     """A producer that offers nothing but DLPack, so only that path can read it."""
@@ -792,6 +834,22 @@ class PybindingsTest(PybindingsTestBase):
         self.assertRegex(data, r"^RuntimeError .*has no data")
         self.assertRegex(wrapping, r"^RuntimeError .*has no data")
         self.assertRegex(negative, r"^RuntimeError .*-3 dimensions, which is not")
+
+    def test_methods_on_separate_threads_with_torch_inputs(self) -> None:
+        # Repeated, because the failure it guards against depends on how the
+        # threads happen to interleave and showed up in most runs, not all.
+        exported_program, _ = create_program(ModuleAdd())
+        with tempfile.NamedTemporaryFile(suffix=".pte") as pte:
+            pte.write(exported_program.buffer)
+            pte.flush()
+            for _ in range(3):
+                child = subprocess.run(
+                    [sys.executable, "-c", _THREADED_TORCH_CALLS, pte.name],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+                self.assertEqual(child.stdout.strip(), "ran")
 
     def test_refused_set_inputs_keeps_the_capsule_it_claimed(self) -> None:
         # Claiming a capsule promises the producer that the memory stays where it
