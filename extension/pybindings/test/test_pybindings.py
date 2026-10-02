@@ -2157,3 +2157,70 @@ class PybindingsTest(PybindingsTestBase):
             torch.cuda.synchronize()
             free_at_end, _ = torch.cuda.mem_get_info()
             self.assertGreaterEqual(free_at_end - free_after_device, device_bytes * 0.9)
+
+    def test_device_result_has_its_own_memory(self):
+        # A result that stays on the device used to be refused. It now comes back
+        # through DLPack, and it has to own its memory: the output buffer belongs
+        # to the method, so a result that pointed into it would be written over by
+        # the next call.
+        if "CudaBackend" not in self.runtime._get_registered_backend_names():
+            self.skipTest("needs a build with the CUDA backend linked in")
+        if not torch.cuda.is_available():
+            self.skipTest("needs a visible CUDA device")
+
+        from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
+        from executorch.exir import to_edge_transform_and_lower
+        from executorch.exir.backend.compile_spec_schema import CompileSpec
+        from executorch.exir.passes.propagate_device_config import PropagateDeviceConfig
+
+        inputs = (torch.ones(4, 8), torch.ones(4, 8))
+
+        class Add(torch.nn.Module):
+            def forward(self, x, y):
+                return x + y
+
+        edge = to_edge_transform_and_lower(
+            export(Add(), inputs, strict=True),
+            partitioner=[CudaPartitioner([CompileSpec("method_name", b"forward")])],
+        )
+        exported_program = edge.to_executorch(
+            config=ExecutorchBackendConfig(
+                propagate_device_config=PropagateDeviceConfig(
+                    skip_h2d_for_method_inputs=True,
+                    skip_d2h_for_method_outputs=True,
+                ),
+                enable_non_cpu_memory_planning=True,
+                memory_planning_pass=MemoryPlanningPass(
+                    alloc_graph_input=False, alloc_graph_output=True
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            pte_path = os.path.join(directory, "program.pte")
+            with open(pte_path, "wb") as pte_file:
+                exported_program.write_to_file(pte_file)
+            data_names = sorted(exported_program._tensor_data or {})
+            exported_program.write_tensor_data_to_file(directory)
+            data_path = (
+                os.path.join(directory, data_names[0] + ".ptd") if data_names else None
+            )
+            method = self.runtime._load_program(
+                pte_path, data_path=data_path
+            ).load_method("forward")
+
+            def run(value):
+                x = torch.full((4, 8), value, device="cuda")
+                method.set_inputs([x, x])
+                method.execute()
+                result = method.get_outputs()[0]
+                if isinstance(result, torch.Tensor):
+                    return result
+                return torch.from_dlpack(result)
+
+            first = run(1.0)
+            self.assertEqual(first.device.type, "cuda")
+            second = run(5.0)
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(first.cpu(), torch.full((4, 8), 2.0)))
+            self.assertTrue(torch.equal(second.cpu(), torch.full((4, 8), 10.0)))
+            self.assertNotEqual(first.data_ptr(), second.data_ptr())

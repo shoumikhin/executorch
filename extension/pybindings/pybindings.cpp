@@ -966,13 +966,50 @@ DLDataType dlpack_dtype(executorch::aten::ScalarType scalar_type) {
 /// An owned copy of a tensor the runtime produced, readable through CPython's
 /// buffer protocol, so `numpy.asarray(output)` needs no copy and no torch. It
 /// is a copy rather than a view because output memory is planned at export time
-/// and the next execution writes over it.
+/// and the next execution writes over it. A result on a device is copied into
+/// device memory of its own instead, for the same reason, and only DLPack can
+/// read it: the host cannot.
 struct PyTensorBuffer final {
   explicit PyTensorBuffer(const executorch::aten::Tensor& tensor)
       : PyTensorBuffer(tensor, std::vector<uint8_t>(tensor.nbytes())) {
     if (tensor.const_data_ptr() != nullptr) {
       std::memcpy(data_.data(), tensor.const_data_ptr(), data_.size());
     }
+  }
+
+  // The device allocator copies only between the host and a device, so the
+  // bytes cross through host memory on the way into this result's own buffer.
+  static PyTensorBuffer on_device(const executorch::aten::Tensor& tensor) {
+    const auto device = tensor.device();
+    auto* allocator = runtime::get_device_allocator(device.type());
+    if (allocator == nullptr) {
+      throw std::runtime_error(
+          "This result is on a device that no allocator is registered for.");
+    }
+    auto owned = DeviceMemoryBuffer::create(
+        tensor.nbytes(), device.type(), device.index());
+    THROW_IF_ERROR(
+        owned.error(),
+        "Failed to allocate %zu bytes on the device for a result",
+        tensor.nbytes());
+    PyTensorBuffer result(tensor, std::vector<uint8_t>());
+    if (tensor.nbytes() != 0) {
+      std::vector<uint8_t> staging(tensor.nbytes());
+      THROW_IF_ERROR(
+          allocator->copy_device_to_host(
+              staging.data(),
+              tensor.const_data_ptr(),
+              staging.size(),
+              device.index()),
+          "Failed to copy a result off the device");
+      THROW_IF_ERROR(
+          allocator->copy_host_to_device(
+              owned->data(), staging.data(), staging.size(), device.index()),
+          "Failed to copy a result into its own device memory");
+    }
+    result.device_ = device;
+    result.device_data_ = std::move(owned.get());
+    return result;
   }
 
   // Takes the bytes the runtime wrote into instead of copying them. Used for an
@@ -1002,10 +1039,19 @@ struct PyTensorBuffer final {
   }
 
   void* data() {
-    return data_.data();
+    return is_on_device() ? device_data_.data() : data_.data();
+  }
+
+  bool is_on_device() const {
+    return !device_.is_cpu();
   }
 
   py::buffer_info buffer_info() {
+    if (is_on_device()) {
+      throw py::buffer_error(
+          "This result is in device memory, which the host cannot read. Use "
+          "DLPack, for example torch.from_dlpack or cupy.from_dlpack.");
+    }
     // A dtype with no format code, bfloat16 above all, still has a width and a
     // shape. Presenting an unsigned integer of that width keeps both, so a
     // reader sees the right elements in the right places and only has to
@@ -1029,7 +1075,7 @@ struct PyTensorBuffer final {
   py::capsule dlpack(py::object self, py::object /*stream*/) {
     auto managed = std::make_unique<DLManagedTensor>();
     managed->dl_tensor.data = data();
-    managed->dl_tensor.device = {kDeviceType, kDeviceIndex};
+    managed->dl_tensor.device = dlpack_device_of(device_);
     managed->dl_tensor.ndim = static_cast<int32_t>(shape_.size());
     managed->dl_tensor.dtype = dlpack_dtype(scalar_type_);
     managed->dl_tensor.shape = dlpack_shape_.data();
@@ -1058,7 +1104,9 @@ struct PyTensorBuffer final {
   }
 
   py::tuple dlpack_device() const {
-    return py::make_tuple(kDeviceType, kDeviceIndex);
+    const auto described = dlpack_device_of(device_);
+    return py::make_tuple(
+        static_cast<int32_t>(described.device_type), described.device_id);
   }
 
   py::tuple shape() const {
@@ -1074,7 +1122,7 @@ struct PyTensorBuffer final {
   }
 
   size_t nbytes() const {
-    return data_.size();
+    return is_on_device() ? device_data_.size() : data_.size();
   }
 
   std::string repr() const {
@@ -1082,15 +1130,21 @@ struct PyTensorBuffer final {
     for (size_t i = 0; i < shape_.size(); ++i) {
       sizes += (i == 0 ? "" : ", ") + std::to_string(shape_[i]);
     }
+    std::string where;
+    if (is_on_device()) {
+      where = ", device=cuda:" + std::to_string(device_.index());
+    }
     return "TensorBuffer(shape=(" + sizes +
-        "), dtype=" + executorch::runtime::toString(scalar_type_) + ")";
+        "), dtype=" + executorch::runtime::toString(scalar_type_) + where + ")";
   }
 
  private:
-  /// These bytes are always the host's: output_to_py refuses a result in device
-  /// memory before one of these is built.
-  static constexpr int32_t kDeviceType = kDLCPU;
-  static constexpr int32_t kDeviceIndex = 0;
+  static DLDevice dlpack_device_of(const executorch::aten::Device& device) {
+    if (device.is_cpu()) {
+      return {kDLCPU, 0};
+    }
+    return {kDLCUDA, static_cast<int32_t>(device.index())};
+  }
 
   executorch::aten::ScalarType scalar_type_;
   py::ssize_t itemsize_;
@@ -1102,6 +1156,8 @@ struct PyTensorBuffer final {
   std::vector<int64_t> dlpack_shape_;
   std::vector<int64_t> dlpack_strides_;
   std::vector<uint8_t> data_;
+  executorch::aten::Device device_{executorch::aten::DeviceType::CPU, 0};
+  DeviceMemoryBuffer device_data_;
 };
 
 // The torch dtypes that match a runtime scalar type, by the name torch itself
@@ -1273,11 +1329,16 @@ py::object output_to_py(
     const executorch::aten::Tensor& tensor,
     std::vector<uint8_t>* owned,
     bool as_torch) {
-  // Asked once here rather than in each arm below, because every one of them
-  // reads these bytes, and the host cannot read memory that is not its own.
+  // A result on a device keeps its memory there. It gets device memory of its
+  // own, so the next call cannot write over it, and travels through DLPack,
+  // the one way to hand device memory to torch, CuPy or anything else.
   if (!tensor.device().is_cpu()) {
-    throw std::runtime_error(
-        "This result is in device memory, which the host cannot read. Copy it to the host first.");
+    py::object result = py::cast(PyTensorBuffer::on_device(tensor));
+    if (!as_torch) {
+      return result;
+    }
+    return py::module_::import("sys").attr("modules")["torch"].attr(
+        "from_dlpack")(result);
   }
   // Built only on the paths that hand it back or read from it. Two of the torch
   // paths below build their own storage instead, and building this up front
