@@ -1419,6 +1419,13 @@ def _windows_import_libraries() -> List["BuiltFile"]:
             dependent_cmake_flags=["EXECUTORCH_BUILD_SHARED", *flags],
         )
         for subdir, built, shipped, flags in entries
+    ] + [
+        BuiltFile(
+            src_dir=f"%CMAKE_CACHE_DIR%/{_CFG}",
+            src_name="executorch_device_allocator_registry.lib",
+            dst="executorch/lib/executorch_device_allocator_registry.lib",
+            dependent_cmake_flags=["EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_SHARED"],
+        ),
     ]
 
 
@@ -3108,6 +3115,15 @@ setup(
                     dependent_cmake_flags=[
                         "EXECUTORCH_BUILD_SHARED",
                         "EXECUTORCH_BUILD_CUDA",
+                    ],
+                ),
+                BuiltFile(
+                    src_dir="%CMAKE_CACHE_DIR%/" + _CFG,
+                    src_name=get_dynamic_lib_name("executorch_device_allocator_registry"),
+                    dst="executorch/lib/"
+                    + get_dynamic_lib_name("executorch_device_allocator_registry"),
+                    dependent_cmake_flags=[
+                        "EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_SHARED"
                     ],
                 ),
                 # The stream helper the delegate and the shim layer both record as a

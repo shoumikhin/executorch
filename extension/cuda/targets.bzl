@@ -57,8 +57,9 @@ def define_common_targets():
 
     runtime.cxx_library(
         name = "cuda_allocator",
-        # Allow delegates to share the singleton, as they share caller_stream.
-        force_static = False,
+        # Loading it registers the allocator and the registry aborts on a second
+        # registration, so a process must never hold two copies.
+        preferred_linkage = "shared",
         srcs = [
             "cuda_allocator.cpp",
         ],

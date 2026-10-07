@@ -15,6 +15,22 @@
 #include <executorch/runtime/core/portable_type/device.h>
 #include <executorch/runtime/core/result.h>
 
+// Only the accessor crosses the shared registry boundary; methods stay in core.
+#if defined(EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_SHARED)
+#if defined(_WIN32)
+#if defined(EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_BUILDING)
+#define EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_API __declspec(dllexport)
+#else
+#define EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_API __declspec(dllimport)
+#endif
+#else
+#define EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_API \
+  __attribute__((visibility("default")))
+#endif
+#else
+#define EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_API
+#endif
+
 namespace executorch {
 namespace runtime {
 
@@ -124,7 +140,8 @@ class DeviceAllocatorRegistry {
   /**
    * Returns the singleton instance of the registry.
    */
-  static DeviceAllocatorRegistry& instance();
+  static EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_API DeviceAllocatorRegistry&
+  instance();
 
   /**
    * Register an allocator. The device type is taken from

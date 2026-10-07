@@ -69,7 +69,9 @@ class TensorParserDeviceTest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
     executorch::runtime::runtime_init();
-    register_device_allocator(&g_mock_cuda);
+    if (executorch::runtime::get_device_allocator(DeviceType::CUDA) == nullptr) {
+      register_device_allocator(&g_mock_cuda);
+    }
   }
 
   void SetUp() override {
@@ -191,6 +193,10 @@ TEST_F(TensorParserDeviceTest, NonDelegatedTensorsDefaultToCPU) {
   }
 }
 TEST_F(TensorParserDeviceTest, CudaTensorDataPtrPointsToDeviceMemory) {
+  if (executorch::runtime::get_device_allocator(DeviceType::CUDA) !=
+      &g_mock_cuda) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   Result<Program> program =
       Program::load(loader_.get(), Program::Verification::Minimal);
   ASSERT_EQ(program.error(), Error::Ok);

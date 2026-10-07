@@ -58,6 +58,9 @@ class OpDeviceCopyTest : public OperatorTest {
 
   void SetUp() override {
     OperatorTest::SetUp();
+    if (get_device_allocator(DeviceType::CUDA) != &g_mock_cuda) {
+      GTEST_SKIP() << "These tests require their mock CUDA allocator";
+    }
     g_mock_cuda.h2d_count_ = 0;
     g_mock_cuda.d2h_count_ = 0;
     g_mock_cuda.last_h2d_size_ = 0;

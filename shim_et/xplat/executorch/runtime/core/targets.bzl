@@ -85,7 +85,10 @@ def define_common_targets():
 
     runtime.cxx_library(
         name = "device_allocator",
-        srcs = ["device_allocator.cpp"],
+        srcs = [
+            "device_allocator.cpp",
+            "device_allocator_registry.cpp",
+        ],
         exported_headers = [
             "device_allocator.h",
         ],

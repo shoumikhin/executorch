@@ -112,7 +112,7 @@ def _patch_platform_build_mode_flags(kwargs):
 def _patch_force_static(kwargs):
     """For OSS cxx library, force static linkage unless specify otherwise.
     """
-    if "force_static" not in kwargs:
+    if "force_static" not in kwargs and kwargs.get("preferred_linkage") != "shared":
         kwargs["force_static"] = True
     return kwargs
 

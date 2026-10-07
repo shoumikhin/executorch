@@ -13,11 +13,6 @@
 namespace executorch {
 namespace runtime {
 
-DeviceAllocatorRegistry& DeviceAllocatorRegistry::instance() {
-  static DeviceAllocatorRegistry registry;
-  return registry;
-}
-
 void DeviceAllocatorRegistry::register_allocator(DeviceAllocator* alloc) {
   ET_CHECK_MSG(alloc != nullptr, "Cannot register a null allocator");
   auto type = alloc->device_type();

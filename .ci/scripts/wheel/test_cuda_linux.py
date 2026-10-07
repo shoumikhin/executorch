@@ -52,6 +52,7 @@ def test_cuda_libraries_are_shipped() -> None:
     expected = {
         "libexecutorch_backend_cuda.so",
         "libexecutorch_extension_cuda.so",
+        "libexecutorch_device_allocator_registry.so",
     }
     missing = sorted(expected - shipped)
     assert not missing, (

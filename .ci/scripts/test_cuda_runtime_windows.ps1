@@ -31,6 +31,7 @@ $env:EXECUTORCH_CUDA_TEST_REQUIRE_NO_MEMORY_POOLS = "1"
 
 $tests = @(
     "test_cuda_allocator",
+    "test_cuda_allocator_registration",
     "test_cuda_mutable_state",
     "test_cuda_weight_cache",
     "test_cuda_sort_rand",

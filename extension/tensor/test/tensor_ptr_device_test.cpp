@@ -33,17 +33,13 @@ using executorch::runtime::testing::MockCudaAllocator;
 
 static MockCudaAllocator g_mock_cuda;
 
-struct RegisterMockAllocator {
-  RegisterMockAllocator() {
-    register_device_allocator(&g_mock_cuda);
-  }
-};
-const RegisterMockAllocator s_register;
-
 class TensorPtrDeviceTest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
     runtime_init();
+    if (get_device_allocator(DeviceType::CUDA) == nullptr) {
+      register_device_allocator(&g_mock_cuda);
+    }
   }
 
   void SetUp() override {
@@ -54,7 +50,17 @@ class TensorPtrDeviceTest : public ::testing::Test {
   }
 };
 
-TEST_F(TensorPtrDeviceTest, CpuToDeviceTensor) {
+class TensorPtrMockDeviceTest : public TensorPtrDeviceTest {
+ protected:
+  void SetUp() override {
+    TensorPtrDeviceTest::SetUp();
+    if (get_device_allocator(DeviceType::CUDA) != &g_mock_cuda) {
+      GTEST_SKIP() << "These tests require their mock CUDA allocator";
+    }
+  }
+};
+
+TEST_F(TensorPtrMockDeviceTest, CpuToDeviceTensor) {
   auto cpu_tensor =
       make_tensor_ptr({2, 3}, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
@@ -74,7 +80,7 @@ TEST_F(TensorPtrDeviceTest, CpuToDeviceTensor) {
   EXPECT_EQ(g_mock_cuda.h2d_count_, 1);
 }
 
-TEST_F(TensorPtrDeviceTest, CpuToDeviceFromRawData) {
+TEST_F(TensorPtrMockDeviceTest, CpuToDeviceFromRawData) {
   constexpr std::array<float, 4> data{10.0f, 20.0f, 30.0f, 40.0f};
   auto cpu_tensor = make_tensor_ptr({2, 2}, const_cast<float*>(data.data()));
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
@@ -96,7 +102,7 @@ TEST_F(TensorPtrDeviceTest, CpuToDeviceFromRawData) {
 
 // Device-to-host clone needs TensorImpl device metadata, available only in the
 // non-ATen (ExecuTorch portable) path.
-TEST_F(TensorPtrDeviceTest, DeviceToCpuTensor) {
+TEST_F(TensorPtrMockDeviceTest, DeviceToCpuTensor) {
   auto cpu_tensor =
       make_tensor_ptr({2, 3}, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
@@ -116,7 +122,7 @@ TEST_F(TensorPtrDeviceTest, DeviceToCpuTensor) {
   EXPECT_EQ(g_mock_cuda.d2h_count_, 1);
 }
 
-TEST_F(TensorPtrDeviceTest, DeviceToCpuPreservesShapeDynamism) {
+TEST_F(TensorPtrMockDeviceTest, DeviceToCpuPreservesShapeDynamism) {
   auto cpu_tensor = make_tensor_ptr(
       std::vector<executorch::aten::SizesType>{2},
       std::vector<float>{1.0f, 2.0f},
@@ -132,7 +138,7 @@ TEST_F(TensorPtrDeviceTest, DeviceToCpuPreservesShapeDynamism) {
       executorch::aten::TensorShapeDynamism::STATIC);
 }
 
-TEST_F(TensorPtrDeviceTest, RoundtripCpuDeviceCpu) {
+TEST_F(TensorPtrMockDeviceTest, RoundtripCpuDeviceCpu) {
   const std::vector<float> original = {1.5f, 2.5f, 3.5f, 4.5f, 5.5f, 6.5f};
   auto cpu_tensor = make_tensor_ptr({2, 3}, original);
 
@@ -154,7 +160,7 @@ TEST_F(TensorPtrDeviceTest, RoundtripCpuDeviceCpu) {
   EXPECT_EQ(roundtrip_tensor->scalar_type(), cpu_tensor->scalar_type());
 }
 
-TEST_F(TensorPtrDeviceTest, RoundtripInt32) {
+TEST_F(TensorPtrMockDeviceTest, RoundtripInt32) {
   auto cpu_tensor = make_tensor_ptr({4}, std::vector<int32_t>{10, 20, 30, 40});
 
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
@@ -168,7 +174,7 @@ TEST_F(TensorPtrDeviceTest, RoundtripInt32) {
   }
 }
 
-TEST_F(TensorPtrDeviceTest, DeviceIndexPropagation) {
+TEST_F(TensorPtrMockDeviceTest, DeviceIndexPropagation) {
   auto cpu_tensor = make_tensor_ptr({2}, {1.0f, 2.0f});
   auto device_tensor =
       clone_tensor_ptr_to(cpu_tensor, Device(DeviceType::CUDA, /*index=*/1));
@@ -180,7 +186,7 @@ TEST_F(TensorPtrDeviceTest, DeviceIndexPropagation) {
   EXPECT_FLOAT_EQ(roundtrip->const_data_ptr<float>()[1], 2.0f);
 }
 
-TEST_F(TensorPtrDeviceTest, DeviceMemoryCleanup) {
+TEST_F(TensorPtrMockDeviceTest, DeviceMemoryCleanup) {
   {
     auto cpu_tensor = make_tensor_ptr({2}, {1.0f, 2.0f});
     auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
@@ -190,7 +196,7 @@ TEST_F(TensorPtrDeviceTest, DeviceMemoryCleanup) {
   EXPECT_EQ(g_mock_cuda.deallocate_count_, 1);
 }
 
-TEST_F(TensorPtrDeviceTest, ScalarTensorRoundtrip) {
+TEST_F(TensorPtrMockDeviceTest, ScalarTensorRoundtrip) {
   auto cpu_tensor = make_tensor_ptr({}, {42.0f});
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
 
@@ -203,7 +209,7 @@ TEST_F(TensorPtrDeviceTest, ScalarTensorRoundtrip) {
   EXPECT_FLOAT_EQ(roundtrip->const_data_ptr<float>()[0], 42.0f);
 }
 
-TEST_F(TensorPtrDeviceTest, RawDataRoundtrip) {
+TEST_F(TensorPtrMockDeviceTest, RawDataRoundtrip) {
   constexpr std::array<float, 3> raw_data{100.0f, 200.0f, 300.0f};
   auto cpu_tensor = make_tensor_ptr({3}, const_cast<float*>(raw_data.data()));
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
@@ -231,7 +237,7 @@ TEST_F(TensorPtrDeviceTest, ErrorNullCpuTensorData) {
       "Source tensor has no data");
 }
 
-TEST_F(TensorPtrDeviceTest, ErrorDeviceToDevice) {
+TEST_F(TensorPtrMockDeviceTest, ErrorDeviceToDevice) {
   auto cpu_tensor = make_tensor_ptr({2}, {1.0f, 2.0f});
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
   ET_EXPECT_DEATH(
@@ -239,7 +245,7 @@ TEST_F(TensorPtrDeviceTest, ErrorDeviceToDevice) {
       "Device-to-device copy is not supported");
 }
 
-TEST_F(TensorPtrDeviceTest, MakeTensorPtrVectorToDevice) {
+TEST_F(TensorPtrMockDeviceTest, MakeTensorPtrVectorToDevice) {
   auto cpu_tensor =
       make_tensor_ptr({2, 2}, std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f});
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
@@ -261,7 +267,7 @@ TEST_F(TensorPtrDeviceTest, MakeTensorPtrVectorToDevice) {
   EXPECT_FLOAT_EQ(data[3], 4.0f);
 }
 
-TEST_F(TensorPtrDeviceTest, MakeTensorPtrRawPointerToDevice) {
+TEST_F(TensorPtrMockDeviceTest, MakeTensorPtrRawPointerToDevice) {
   constexpr std::array<float, 3> raw{5.0f, 6.0f, 7.0f};
   auto cpu_tensor = make_tensor_ptr({3}, const_cast<float*>(raw.data()));
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
@@ -282,7 +288,7 @@ TEST_F(TensorPtrDeviceTest, MakeTensorPtrRawPointerToDevice) {
   EXPECT_FLOAT_EQ(data[2], 7.0f);
 }
 
-TEST_F(TensorPtrDeviceTest, CloneToCpuVerifiesCpuDeviceMetadata) {
+TEST_F(TensorPtrMockDeviceTest, CloneToCpuVerifiesCpuDeviceMetadata) {
   auto cpu_tensor = make_tensor_ptr({3}, {1.0f, 2.0f, 3.0f});
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
   auto result = clone_tensor_ptr_to(device_tensor, DeviceType::CPU);
@@ -291,7 +297,7 @@ TEST_F(TensorPtrDeviceTest, CloneToCpuVerifiesCpuDeviceMetadata) {
   EXPECT_EQ(result->unsafeGetTensorImpl()->device_index(), 0);
 }
 
-TEST_F(TensorPtrDeviceTest, MultipleClonesFromSameSource) {
+TEST_F(TensorPtrMockDeviceTest, MultipleClonesFromSameSource) {
   auto cpu_tensor = make_tensor_ptr({3}, {1.0f, 2.0f, 3.0f});
   auto device1 = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
   auto device2 = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
@@ -301,7 +307,7 @@ TEST_F(TensorPtrDeviceTest, MultipleClonesFromSameSource) {
   EXPECT_EQ(g_mock_cuda.h2d_count_, 2);
 }
 
-TEST_F(TensorPtrDeviceTest, HighDimensionalTensorRoundtrip) {
+TEST_F(TensorPtrMockDeviceTest, HighDimensionalTensorRoundtrip) {
   std::vector<float> data(24);
   for (size_t i = 0; i < 24; ++i) {
     data[i] = static_cast<float>(i);
@@ -321,7 +327,7 @@ TEST_F(TensorPtrDeviceTest, HighDimensionalTensorRoundtrip) {
   }
 }
 
-TEST_F(TensorPtrDeviceTest, RoundtripDouble) {
+TEST_F(TensorPtrMockDeviceTest, RoundtripDouble) {
   auto cpu_tensor = make_tensor_ptr({3}, std::vector<double>{1.1, 2.2, 3.3});
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
   auto roundtrip = clone_tensor_ptr_to(device_tensor, DeviceType::CPU);
@@ -333,7 +339,7 @@ TEST_F(TensorPtrDeviceTest, RoundtripDouble) {
   EXPECT_DOUBLE_EQ(data[2], 3.3);
 }
 
-TEST_F(TensorPtrDeviceTest, RoundtripInt64) {
+TEST_F(TensorPtrMockDeviceTest, RoundtripInt64) {
   auto cpu_tensor = make_tensor_ptr({3}, std::vector<int64_t>{100, 200, 300});
   auto device_tensor = clone_tensor_ptr_to(cpu_tensor, DeviceType::CUDA);
   auto roundtrip = clone_tensor_ptr_to(device_tensor, DeviceType::CPU);
@@ -345,7 +351,7 @@ TEST_F(TensorPtrDeviceTest, RoundtripInt64) {
   EXPECT_EQ(data[2], 300);
 }
 
-TEST_F(TensorPtrDeviceTest, LargeTensorRoundtrip) {
+TEST_F(TensorPtrMockDeviceTest, LargeTensorRoundtrip) {
   const size_t n = 10000;
   std::vector<float> data(n);
   for (size_t i = 0; i < n; ++i) {
@@ -379,8 +385,10 @@ TEST_F(TensorPtrDeviceTest, MakeTensorPtrTagsDeviceAfterType) {
   EXPECT_EQ(tensor->unsafeGetTensorImpl()->device_type(), DeviceType::CUDA);
   EXPECT_EQ(tensor->unsafeGetTensorImpl()->device_index(), 0);
   EXPECT_EQ(tensor->const_data_ptr(), raw.data());
-  EXPECT_EQ(g_mock_cuda.allocate_count_, 0);
-  EXPECT_EQ(g_mock_cuda.h2d_count_, 0);
+  if (get_device_allocator(DeviceType::CUDA) == &g_mock_cuda) {
+    EXPECT_EQ(g_mock_cuda.allocate_count_, 0);
+    EXPECT_EQ(g_mock_cuda.h2d_count_, 0);
+  }
 }
 
 TEST_F(TensorPtrDeviceTest, MakeTensorPtrDefaultsToCpu) {
@@ -430,7 +438,9 @@ TEST_F(TensorPtrDeviceTest, MakeTensorPtrPrimaryTagsDeviceAfterType) {
 
   EXPECT_EQ(tensor->unsafeGetTensorImpl()->device_type(), DeviceType::CUDA);
   EXPECT_EQ(tensor->const_data_ptr(), raw.data());
-  EXPECT_EQ(g_mock_cuda.allocate_count_, 0);
+  if (get_device_allocator(DeviceType::CUDA) == &g_mock_cuda) {
+    EXPECT_EQ(g_mock_cuda.allocate_count_, 0);
+  }
 }
 
 TEST_F(TensorPtrDeviceTest, FromBlobTagsDeviceAfterType) {
@@ -443,7 +453,9 @@ TEST_F(TensorPtrDeviceTest, FromBlobTagsDeviceAfterType) {
 
   EXPECT_EQ(tensor->unsafeGetTensorImpl()->device_type(), DeviceType::CUDA);
   EXPECT_EQ(tensor->const_data_ptr(), raw.data());
-  EXPECT_EQ(g_mock_cuda.allocate_count_, 0);
+  if (get_device_allocator(DeviceType::CUDA) == &g_mock_cuda) {
+    EXPECT_EQ(g_mock_cuda.allocate_count_, 0);
+  }
 }
 
 TEST_F(TensorPtrDeviceTest, FromBlobDefaultsToCpu) {
@@ -551,8 +563,10 @@ TEST_F(TensorPtrDeviceTest, ViewOfDeviceTensorInheritsDeviceAndIndex) {
   EXPECT_EQ(reshaped->unsafeGetTensorImpl()->device_index(), 1);
   EXPECT_EQ(view->const_data_ptr(), raw.data());
   EXPECT_EQ(reshaped->const_data_ptr(), raw.data());
-  EXPECT_EQ(g_mock_cuda.allocate_count_, 0);
-  EXPECT_EQ(g_mock_cuda.h2d_count_, 0);
+  if (get_device_allocator(DeviceType::CUDA) == &g_mock_cuda) {
+    EXPECT_EQ(g_mock_cuda.allocate_count_, 0);
+    EXPECT_EQ(g_mock_cuda.h2d_count_, 0);
+  }
 }
 
 // Every `from_blob` overload has to carry the device index through, not just

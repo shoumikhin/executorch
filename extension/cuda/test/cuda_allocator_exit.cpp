@@ -106,7 +106,11 @@ int main() {
   if (std::atexit(free_at_exit) != 0) {
     return 1;
   }
-  allocator = &CudaAllocator::instance();
+  allocator = executorch::runtime::get_device_allocator(
+      executorch::runtime::etensor::DeviceType::CUDA);
+  if (allocator != &CudaAllocator::instance()) {
+    fail("the CUDA extension did not register its allocator");
+  }
   auto result = allocator->allocate(1024, -1, 4096);
   if (!result.ok() || result.get() != storage + 4096) {
     fail("allocate did not round the block up");

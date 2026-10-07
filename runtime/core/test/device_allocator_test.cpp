@@ -128,15 +128,7 @@ class MockDeviceAllocator : public DeviceAllocator {
   uint8_t dummy_buffer_[64] = {};
 };
 
-/**
- * Test fixture that owns a single MockDeviceAllocator with static lifetime
- * and registers it in DeviceAllocatorRegistry exactly once for the whole
- * test suite. Every test in this fixture exercises the same registered
- * allocator instance via get_device_allocator(), which mirrors how real
- * code is expected to use the registry (one allocator per device type,
- * registered during static initialization). Per-test isolation is provided
- * by reset_counters() in SetUp().
- */
+/** Registers a static-lifetime mock only if CUDA has no allocator yet. */
 class DeviceAllocatorTest : public ::testing::Test {
  protected:
   static MockDeviceAllocator& cuda_allocator() {
@@ -157,6 +149,9 @@ class DeviceAllocatorTest : public ::testing::Test {
 };
 
 TEST_F(DeviceAllocatorTest, RegisteredAllocatorReportsCorrectDeviceType) {
+  if (get_device_allocator(DeviceType::CUDA) != &cuda_allocator()) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   DeviceAllocator* alloc = get_device_allocator(DeviceType::CUDA);
   ASSERT_NE(alloc, nullptr);
   EXPECT_EQ(alloc, &cuda_allocator());
@@ -164,6 +159,9 @@ TEST_F(DeviceAllocatorTest, RegisteredAllocatorReportsCorrectDeviceType) {
 }
 
 TEST_F(DeviceAllocatorTest, AllocateAndDeallocate) {
+  if (get_device_allocator(DeviceType::CUDA) != &cuda_allocator()) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   DeviceAllocator* alloc = get_device_allocator(DeviceType::CUDA);
   ASSERT_NE(alloc, nullptr);
 
@@ -182,6 +180,9 @@ TEST_F(DeviceAllocatorTest, AllocateAndDeallocate) {
 }
 
 TEST_F(DeviceAllocatorTest, CopyHostToDevice) {
+  if (get_device_allocator(DeviceType::CUDA) != &cuda_allocator()) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   DeviceAllocator* alloc = get_device_allocator(DeviceType::CUDA);
   ASSERT_NE(alloc, nullptr);
 
@@ -200,6 +201,9 @@ TEST_F(DeviceAllocatorTest, CopyHostToDevice) {
 }
 
 TEST_F(DeviceAllocatorTest, CopyDeviceToHost) {
+  if (get_device_allocator(DeviceType::CUDA) != &cuda_allocator()) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   DeviceAllocator* alloc = get_device_allocator(DeviceType::CUDA);
   ASSERT_NE(alloc, nullptr);
 
@@ -236,8 +240,7 @@ TEST_F(DeviceAllocatorTest, RegistrySingletonInstance) {
 // platforms without fork() (e.g. iOS).  Skip on those platforms.
 #if GTEST_HAS_DEATH_TEST
 TEST_F(DeviceAllocatorTest, RegisteringSameDeviceTypeTwiceAborts) {
-  // The fixture has already registered cuda_allocator() for CUDA; attempting
-  // to register a second allocator for the same device type must abort.
+  // CUDA already has an allocator; a second registration must abort.
   MockDeviceAllocator another_allocator(DeviceType::CUDA);
   EXPECT_DEATH(
       register_device_allocator(&another_allocator),

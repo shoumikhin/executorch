@@ -65,11 +65,16 @@ TEST_F(ModuleDeviceMemoryTest, CpuOnlyModelDoesNotAllocateDeviceMemory) {
   auto err = module.load_method("forward");
   ASSERT_EQ(err, Error::Ok);
 
-  EXPECT_EQ(g_mock_cuda.allocate_count_, 0)
-      << "CPU-only model should not allocate device memory";
+  if (get_device_allocator(DeviceType::CUDA) == &g_mock_cuda) {
+    EXPECT_EQ(g_mock_cuda.allocate_count_, 0)
+        << "CPU-only model should not allocate device memory";
+  }
 }
 
 TEST_F(ModuleDeviceMemoryTest, DeviceMemoryBufferCreateCallsAllocator) {
+  if (get_device_allocator(DeviceType::CUDA) != &g_mock_cuda) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   // Directly test DeviceMemoryBuffer::create with the registered mock.
   // This verifies the RAII allocation/deallocation path that Module uses.
   {
@@ -153,6 +158,9 @@ TEST_F(ModuleDeviceMemoryTest, DeviceModelWithSharedArenasReturnsNotSupported) {
 }
 
 TEST_F(ModuleDeviceMemoryTest, DeviceAllocationFailureIsReportedNotFatal) {
+  if (get_device_allocator(DeviceType::CUDA) != &g_mock_cuda) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   const char* path = std::getenv("ET_MODULE_ADD_WITH_DEVICE_PATH");
   ASSERT_NE(path, nullptr) << "ET_MODULE_ADD_WITH_DEVICE_PATH not set";
 
@@ -176,6 +184,9 @@ TEST_F(ModuleDeviceMemoryTest, DeviceAllocationFailureIsReportedNotFatal) {
 TEST_F(
     ModuleDeviceMemoryTest,
     LoadMethodAllocatesDeviceMemoryAndDeallocatesOnDestroy) {
+  if (get_device_allocator(DeviceType::CUDA) != &g_mock_cuda) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   const char* path = std::getenv("ET_MODULE_ADD_WITH_DEVICE_PATH");
   ASSERT_NE(path, nullptr) << "ET_MODULE_ADD_WITH_DEVICE_PATH not set";
 

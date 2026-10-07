@@ -628,7 +628,55 @@ list(FILTER _executorch_core__srcs EXCLUDE REGEX
 # Add the source file that maps to the requested default PAL implementation.
 list(APPEND _executorch_core__srcs ${EXECUTORCH_PAL_DEFAULT_FILE_PATH})
 
+set(EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_SHARED OFF)
+if(EXECUTORCH_BUILD_CUDA OR EXECUTORCH_BUILD_ROCM)
+  set(EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_SHARED ON)
+  # Static core consumers and the shared extension must use the same table.
+  list(FILTER _executorch_core__srcs EXCLUDE REGEX
+       "runtime/core/device_allocator_registry\\.cpp$"
+  )
+  add_library(
+    executorch_device_allocator_registry SHARED
+    runtime/core/device_allocator_registry.cpp
+  )
+  target_include_directories(
+    executorch_device_allocator_registry PUBLIC ${_common_include_directories}
+  )
+  target_compile_definitions(
+    executorch_device_allocator_registry
+    PUBLIC C10_USING_CUSTOM_GENERATED_MACROS
+           EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_SHARED
+    PRIVATE EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_BUILDING
+  )
+  if(WIN32)
+    target_compile_features(executorch_device_allocator_registry PUBLIC cxx_std_20)
+  else()
+    target_compile_features(executorch_device_allocator_registry PUBLIC cxx_std_17)
+  endif()
+  set_target_properties(
+    executorch_device_allocator_registry
+    PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS OFF CXX_VISIBILITY_PRESET hidden
+  )
+  executorch_target_soname_policy(executorch_device_allocator_registry)
+  install(
+    TARGETS executorch_device_allocator_registry
+    EXPORT ExecuTorchTargets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  )
+endif()
+set(EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_SHARED
+    ${EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_SHARED}
+    CACHE INTERNAL "Whether the device allocator registry ships separately" FORCE
+)
+
 add_library(executorch_core ${_executorch_core__srcs})
+if(TARGET executorch_device_allocator_registry)
+  target_link_libraries(
+    executorch_core PUBLIC executorch_device_allocator_registry
+  )
+endif()
 
 # Legacy name alias.
 add_library(executorch_no_prim_ops ALIAS executorch_core)
@@ -693,6 +741,11 @@ if(EXECUTORCH_BUILD_PYBIND AND APPLE)
   # shared version
   add_library(executorch_core_shared SHARED ${_executorch_core__srcs})
   target_link_libraries(executorch_core_shared PRIVATE program_schema)
+  if(TARGET executorch_device_allocator_registry)
+    target_link_libraries(
+      executorch_core_shared PUBLIC executorch_device_allocator_registry
+    )
+  endif()
   if(DL_LIBRARY_EXISTS)
     # For dladdr()
     target_link_libraries(executorch_core_shared PRIVATE dl)
@@ -722,6 +775,9 @@ endif()
 #
 add_library(executorch ${_executorch__srcs})
 target_link_libraries(executorch PRIVATE executorch_core)
+if(TARGET executorch_device_allocator_registry)
+  target_link_libraries(executorch PUBLIC executorch_device_allocator_registry)
+endif()
 target_include_directories(executorch PUBLIC ${_common_include_directories})
 target_compile_definitions(executorch PUBLIC C10_USING_CUSTOM_GENERATED_MACROS)
 if(NOT EXECUTORCH_ENABLE_LOGGING)
@@ -1064,6 +1120,12 @@ endif()
 # registry.
 if(EXECUTORCH_BUILD_SHARED)
   executorch_add_shared_library(executorch_shared)
+  if(TARGET executorch_device_allocator_registry)
+    # MSVC bundles core objects without their link dependencies.
+    target_link_libraries(
+      executorch_shared PUBLIC executorch_device_allocator_registry
+    )
+  endif()
   set_target_properties(
     executorch_shared
     PROPERTIES OUTPUT_NAME executorch
@@ -1138,6 +1200,12 @@ if(EXECUTORCH_BUILD_SHARED)
     # Matches the CMake package, which adds both to the runtime whenever the
     # thread pool ships. Without the definition, parallel_for runs serially.
     set(_executorch_pc_libs "-lexecutorch")
+    if(TARGET executorch_device_allocator_registry)
+      string(APPEND _executorch_pc_definitions
+             " -DEXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_SHARED"
+      )
+      string(APPEND _executorch_pc_libs " -lexecutorch_device_allocator_registry")
+    endif()
     if(TARGET extension_threadpool)
       string(APPEND _executorch_pc_definitions " -DET_USE_THREADPOOL")
       string(APPEND _executorch_pc_libs " -lexecutorch_threadpool")

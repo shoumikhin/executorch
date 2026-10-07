@@ -129,6 +129,13 @@ class CudaAllocatorTest : public testing::Test {
 static_assert(
     std::is_same_v<CudaAllocator, executorch::extension::cuda::CudaAllocator>);
 
+TEST(CudaAllocatorCompatibilityTest, BackendUsesRegisteredSingleton) {
+  EXPECT_EQ(
+      executorch::runtime::get_device_allocator(
+          executorch::runtime::etensor::DeviceType::CUDA),
+      &CudaAllocator::instance());
+}
+
 TEST(CudaAllocatorCompatibilityTest, OnlyTheSingletonCanBeConstructed) {
   EXPECT_FALSE(std::is_default_constructible_v<CudaAllocator>);
   EXPECT_FALSE(std::is_copy_constructible_v<CudaAllocator>);

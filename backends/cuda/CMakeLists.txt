@@ -482,6 +482,13 @@ install(
 if(BUILD_TESTING)
   include(${EXECUTORCH_ROOT}/tools/cmake/Test.cmake)
 
+  if(TARGET test_cuda_allocator_registration AND _executorch_cuda_ships_libraries)
+    add_test(
+      NAME test_cuda_allocator_registration_backend
+      COMMAND test_cuda_allocator_registration $<TARGET_FILE:aoti_cuda_backend>
+    )
+  endif()
+
   et_cxx_test(
     test_cuda_allocator SOURCES runtime/test/test_cuda_allocator.cpp EXTRA_LIBS
     aoti_cuda_backend

@@ -43,9 +43,13 @@ if(EXECUTORCH_BUILD_SHARED)
     extension_cuda PROPERTIES OUTPUT_NAME executorch_extension_cuda
   )
   executorch_target_soname_policy(extension_cuda)
-  # Ships beside libexecutorch.so in the wheel's lib/ directory.
-  executorch_target_shipped_runtime_path(extension_cuda)
 endif()
+# Retain the sole allocator registrar, including in static-core builds.
+executorch_target_shipped_runtime_path(extension_cuda)
+executorch_target_link_options_shared_lib(extension_cuda)
+target_link_libraries(
+  extension_cuda PUBLIC executorch_device_allocator_registry
+)
 # The allocator and device guard call the runtime. The caller-stream helper
 # treats its handle as opaque. The toolkit is present in accelerator builds.
 if(EXECUTORCH_BUILD_ROCM)
@@ -53,10 +57,8 @@ if(EXECUTORCH_BUILD_ROCM)
 else()
   target_link_libraries(extension_cuda PUBLIC CUDA::cudart)
 endif()
-# The allocator and device guard log through the ExecuTorch runtime. Where one
-# shared runtime exists, the helper retains it so there is a single registry.
-# Where it does not, the helper does nothing, and this library carries the parts
-# of the static core it needs instead.
+# Registry storage is shared above; the remaining runtime code follows the
+# configured core layout.
 if(EXECUTORCH_BUILD_SHARED)
   executorch_target_link_shared_runtime(extension_cuda)
 else()
@@ -79,12 +81,36 @@ if(BUILD_TESTING
    AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
    AND NOT EXECUTORCH_BUILD_ROCM
 )
-  # Interposes CUDA allocation calls and must not load the backend's registrar.
+  # Checks extension-only registration and interposes CUDA allocation calls.
   add_executable(test_cuda_allocator_exit test/cuda_allocator_exit.cpp)
   target_link_libraries(
     test_cuda_allocator_exit PRIVATE extension_cuda executorch_core
   )
   add_test(NAME test_cuda_allocator_exit COMMAND test_cuda_allocator_exit)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(
+    test_cuda_allocator_registration test/cuda_allocator_registration.cpp
+  )
+  target_link_libraries(
+    test_cuda_allocator_registration PRIVATE extension_cuda executorch_core
+                                             ${CMAKE_DL_LIBS}
+  )
+  add_test(
+    NAME test_cuda_allocator_registration
+    COMMAND test_cuda_allocator_registration
+  )
+  if(WIN32)
+    set(_dlls "$<TARGET_RUNTIME_DLLS:test_cuda_allocator_registration>")
+    add_custom_command(
+      TARGET test_cuda_allocator_registration
+      POST_BUILD
+      COMMAND
+        "$<$<BOOL:${_dlls}>:${CMAKE_COMMAND};-E;copy_if_different;${_dlls};$<TARGET_FILE_DIR:test_cuda_allocator_registration>>"
+      COMMAND_EXPAND_LISTS
+    )
+  endif()
 endif()
 
 install(

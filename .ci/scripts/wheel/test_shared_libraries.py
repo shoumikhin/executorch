@@ -2873,6 +2873,8 @@ def test_shipped_library_names_are_expected() -> None:
         "libexecutorch_kernels_torchao",
         "libexecutorch_backend_cuda",
         "libexecutorch_extension_cuda",
+        "libexecutorch_device_allocator_registry",
+        # The same library
         # The same library under the name a non-shared build gives it. The shared
         # build renames it to match the other shipped components; every other build
         # leaves this spelling, and the shim layer records whichever one exists as a

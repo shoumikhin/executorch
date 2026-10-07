@@ -553,6 +553,52 @@ elseif(_executorch_runtime_library)
   endif()
 endif()
 
+# The registry is a leaf dependency, not a component that links back to runtime.
+_executorch_find_library(
+  _executorch_registry_library libexecutorch_device_allocator_registry
+)
+if(_executorch_registry_library)
+  list(APPEND EXECUTORCH_COMPILE_DEFINITIONS
+       EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_SHARED
+  )
+  if(_executorch_targets_supported)
+    if(NOT TARGET executorch::device_allocator_registry)
+      add_library(executorch::device_allocator_registry SHARED IMPORTED)
+      set_target_properties(
+        executorch::device_allocator_registry
+        PROPERTIES
+          IMPORTED_LOCATION "${_executorch_registry_library}"
+          INTERFACE_INCLUDE_DIRECTORIES "${EXECUTORCH_INCLUDE_DIRS}"
+          INTERFACE_COMPILE_FEATURES "cxx_std_${EXECUTORCH_CXX_STANDARD}"
+          INTERFACE_COMPILE_DEFINITIONS
+          "C10_USING_CUSTOM_GENERATED_MACROS;EXECUTORCH_DEVICE_ALLOCATOR_REGISTRY_SHARED"
+      )
+      if(WIN32)
+        string(REGEX REPLACE "\\.dll$" ".lib" _executorch_registry_implib
+                             "${_executorch_registry_library}"
+        )
+        set_target_properties(
+          executorch::device_allocator_registry
+          PROPERTIES IMPORTED_IMPLIB "${_executorch_registry_implib}"
+        )
+      endif()
+      if(TARGET executorch::runtime)
+        target_link_libraries(
+          executorch::runtime INTERFACE executorch::device_allocator_registry
+        )
+      endif()
+    endif()
+    list(APPEND EXECUTORCH_LIBRARIES executorch::device_allocator_registry)
+  elseif(WIN32)
+    string(REGEX REPLACE "\\.dll$" ".lib" _executorch_registry_implib
+                         "${_executorch_registry_library}"
+    )
+    list(APPEND EXECUTORCH_LIBRARIES "${_executorch_registry_implib}")
+  else()
+    list(APPEND EXECUTORCH_LIBRARIES "${_executorch_registry_library}")
+  endif()
+endif()
+
 # Define an imported target for one shipped component library.
 #
 # A component is a prebuilt shared library next to the runtime, such as the CPU
@@ -791,6 +837,11 @@ _executorch_define_component(backend_openvino executorch_backend_openvino)
 _executorch_define_component(backend_cuda executorch_backend_cuda)
 _executorch_define_component(extension_cuda executorch_extension_cuda)
 if(TARGET executorch::extension_cuda)
+  if(TARGET executorch::device_allocator_registry)
+    target_link_libraries(
+      executorch::extension_cuda INTERFACE executorch::device_allocator_registry
+    )
+  endif()
   # Keep toolkit-free stream/guard consumers working without a development kit.
   find_package(CUDAToolkit QUIET)
   if(CUDAToolkit_FOUND)

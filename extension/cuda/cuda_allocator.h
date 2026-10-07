@@ -18,9 +18,8 @@ namespace executorch::extension::cuda {
  * CUDA implementation of DeviceAllocator.
  *
  * Uses cudaMalloc/cudaFree for allocation and cudaMemcpy for host-device
- * transfers. The CUDA backend registers instance() with the
- * DeviceAllocatorRegistry when it is linked. Linking only this library does
- * not register it.
+ * transfers. The shared CUDA extension registers instance() with the
+ * DeviceAllocatorRegistry when it is loaded, independently of any backend.
  *
  * All CUDA memory operations in the CUDA backend should go through this
  * allocator for consistent memory management.

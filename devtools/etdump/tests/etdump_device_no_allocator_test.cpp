@@ -29,7 +29,9 @@ namespace {
 
 TEST(ETDumpNoDeviceAllocatorTest, LogTensorOnUnregisteredDeviceAborts) {
   runtime_init();
-  ASSERT_EQ(get_device_allocator(DeviceType::CUDA), nullptr);
+  if (get_device_allocator(DeviceType::CUDA) != nullptr) {
+    GTEST_SKIP() << "This test requires CUDA to have no registered allocator";
+  }
 
   // Host memory, so the test fails by not dying rather than by crashing if
   // ETDump ever reads the pointer instead of reporting the missing allocator.

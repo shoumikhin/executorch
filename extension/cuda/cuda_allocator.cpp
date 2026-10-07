@@ -30,14 +30,15 @@ using executorch::runtime::etensor::DeviceType;
 
 namespace {
 
-struct PalInitializer final {
-  PalInitializer() {
+struct AllocatorRegistration final {
+  AllocatorRegistration() {
     // A static-runtime build gives this library its own platform state.
     et_pal_init();
+    executorch::runtime::register_device_allocator(&CudaAllocator::instance());
   }
 };
 
-const PalInitializer kPalInitializer{};
+const AllocatorRegistration kAllocatorRegistration{};
 
 // deallocate() must free the address cudaMalloc returned, not the rounded one.
 struct RoundedAllocations {

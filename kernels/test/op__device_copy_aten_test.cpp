@@ -63,20 +63,15 @@ class OpDeviceCopyAtenTest : public ::testing::Test {
     if (get_device_allocator(DeviceType::CUDA) == nullptr) {
       register_device_allocator(&mock_cuda());
     }
-    // The registry has no unregister/replace. If a real CUDA allocator was
-    // registered first (e.g. this test is linked into a binary that pulls in
-    // the CUDA backend, whose static init registers CudaAllocator::instance()),
-    // the mock is not installed and these tests cannot observe the mock
-    // counters. Skip rather than fail in that configuration; in this CPU-only
-    // target the mock is always the registered allocator.
+  }
+
+  void SetUp() override {
+    // A linked CUDA extension may already own the registry entry.
     if (get_device_allocator(DeviceType::CUDA) != &mock_cuda()) {
       GTEST_SKIP()
           << "a non-mock CUDA allocator is registered; these tests require "
           << "MockCudaAllocator and the registry cannot be replaced";
     }
-  }
-
-  void SetUp() override {
     mock_cuda().reset();
   }
 };

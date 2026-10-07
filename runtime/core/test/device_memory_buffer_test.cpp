@@ -111,6 +111,9 @@ TEST_F(DeviceMemoryBufferTest, DefaultConstructedIsEmpty) {
 }
 
 TEST_F(DeviceMemoryBufferTest, CreateAllocatesAndDestructorDeallocates) {
+  if (get_device_allocator(DeviceType::CUDA) != &g_mock_cuda) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   {
     auto result = DeviceMemoryBuffer::create(1024, DeviceType::CUDA, 0);
     ASSERT_TRUE(result.ok());
@@ -133,6 +136,9 @@ TEST_F(DeviceMemoryBufferTest, CreateFailsWithNoRegisteredAllocator) {
 }
 
 TEST_F(DeviceMemoryBufferTest, MoveConstructorTransfersOwnership) {
+  if (get_device_allocator(DeviceType::CUDA) != &g_mock_cuda) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   auto result = DeviceMemoryBuffer::create(256, DeviceType::CUDA, 0);
   ASSERT_TRUE(result.ok());
   auto original = std::move(result.get());
@@ -148,6 +154,9 @@ TEST_F(DeviceMemoryBufferTest, MoveConstructorTransfersOwnership) {
 }
 
 TEST_F(DeviceMemoryBufferTest, MoveAssignmentTransfersOwnership) {
+  if (get_device_allocator(DeviceType::CUDA) != &g_mock_cuda) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   auto result = DeviceMemoryBuffer::create(128, DeviceType::CUDA, 0);
   ASSERT_TRUE(result.ok());
   auto original = std::move(result.get());
@@ -164,10 +173,15 @@ TEST_F(DeviceMemoryBufferTest, MoveAssignmentTransfersOwnership) {
 
 TEST_F(DeviceMemoryBufferTest, DestructorNoOpForDefaultConstructed) {
   { DeviceMemoryBuffer buf; }
-  EXPECT_EQ(g_mock_cuda.deallocate_count_, 0);
+  if (get_device_allocator(DeviceType::CUDA) == &g_mock_cuda) {
+    EXPECT_EQ(g_mock_cuda.deallocate_count_, 0);
+  }
 }
 
 TEST_F(DeviceMemoryBufferTest, AsSpanWrapsDevicePointer) {
+  if (get_device_allocator(DeviceType::CUDA) != &g_mock_cuda) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   auto result = DeviceMemoryBuffer::create(2048, DeviceType::CUDA, 0);
   ASSERT_TRUE(result.ok());
   auto buf = std::move(result.get());
@@ -178,6 +192,9 @@ TEST_F(DeviceMemoryBufferTest, AsSpanWrapsDevicePointer) {
 }
 
 TEST_F(DeviceMemoryBufferTest, CreateUsesDefaultAlignmentWhenUnspecified) {
+  if (get_device_allocator(DeviceType::CUDA) != &g_mock_cuda) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   auto result = DeviceMemoryBuffer::create(1024, DeviceType::CUDA, 0);
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(
@@ -185,6 +202,9 @@ TEST_F(DeviceMemoryBufferTest, CreateUsesDefaultAlignmentWhenUnspecified) {
 }
 
 TEST_F(DeviceMemoryBufferTest, CreateForwardsCustomAlignmentToAllocator) {
+  if (get_device_allocator(DeviceType::CUDA) != &g_mock_cuda) {
+    GTEST_SKIP() << "This test requires its mock CUDA allocator";
+  }
   constexpr size_t kCustomAlignment = 512;
   auto result =
       DeviceMemoryBuffer::create(1024, DeviceType::CUDA, 0, kCustomAlignment);

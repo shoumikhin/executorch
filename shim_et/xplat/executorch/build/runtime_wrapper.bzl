@@ -332,6 +332,18 @@ def _cxx_library_common(*args, **kwargs):
 def _cxx_library(*args, **kwargs):
     define_static_target = kwargs.pop("define_static_target", True)
 
+    # A shared-only library must exist once per process, so its "_static" name
+    # forwards to it instead of compiling a second copy.
+    if kwargs.get("preferred_linkage") == "shared":
+        _cxx_library_common(*args, **kwargs)
+        if define_static_target:
+            _cxx_library_common(
+                name = kwargs["name"] + "_static",
+                exported_deps = [":" + kwargs["name"]],
+                **{k: kwargs[k] for k in ("platforms", "visibility") if k in kwargs}
+            )
+        return
+
     # Determine linkage for this binary based on its children.
     kwargs["preferred_linkage"] = "any"
     _cxx_library_common(*args, **kwargs)
