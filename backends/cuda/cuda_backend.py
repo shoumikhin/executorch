@@ -124,8 +124,8 @@ _SMALL_GPU_GUARD = threading.local()
 @contextlib.contextmanager
 def _allow_triton_templates_on_small_gpus():
     """Let Inductor use Triton templates on GPUs below its 68-SM floor. This
-    backend autotunes with Triton only, so otherwise a matmul or convolution
-    has no Triton choices left.
+    backend autotunes with Triton only by default, so otherwise a matmul or
+    convolution has no Triton choices left.
 
     Only threads inside this context get the override; other threads get the
     original answer.
@@ -457,6 +457,39 @@ def _on_off_compile_spec_value(spec: CompileSpec) -> bool:
     if value not in ["ON", "OFF"]:
         raise ValueError(f"Invalid {spec.key}: {value}. Expected 'ON' or 'OFF'.")
     return value == "ON"
+
+
+def _gemm_backends(spec: Optional[CompileSpec], platform: str) -> str:
+    """Matrix multiplication choices autotuning may pick from: TRITON compiles
+    them into the model, ATEN calls cuBLAS at run time.
+
+    ATEN is opt-in because a cuBLAS call is a separate kernel that Inductor
+    cannot fuse with the ops around it. With max_autotune off, Inductor does
+    not autotune and calls the ATen choice, so matrix multiplications run on
+    cuBLAS whatever this says.
+    """
+    if spec is None:
+        return "TRITON"
+    value = spec.value.decode("utf-8").upper().replace(" ", "")
+    backends = set(value.split(","))
+    if not backends <= {"ATEN", "TRITON"}:
+        raise ValueError(
+            f"Invalid {spec.key}: {value}. Expected ATEN, TRITON or ATEN,TRITON."
+        )
+    if "ATEN" in backends and (torch.version.hip is not None or platform == "windows"):
+        raise ValueError(
+            f"{spec.key}=ATEN runs matrix multiplications on cuBLAS, which only "
+            "the Linux CUDA runtime provides."
+        )
+    if "ATEN" in backends and torch.backends.cuda.matmul.allow_tf32:
+        # Autotuning times torch.mm, which follows TF32, while the shim runs
+        # float32 in full precision, so it could keep a slower cuBLAS call.
+        raise ValueError(
+            f"{spec.key}=ATEN runs float32 matrix multiplications in full "
+            "precision, but TF32 is on for this export. Turn it off with "
+            "torch.backends.cuda.matmul.allow_tf32 = False, or use TRITON."
+        )
+    return value
 
 
 CUDA_GRAPH_AUTOTUNE_TIMING_COMPILE_SPEC = "cuda_graph_autotune_timing"
@@ -860,8 +893,6 @@ class CudaBackend(AotiBackend, BackendDetails):
             ),
             # Enable maximum automatic tuning for optimal performance
             "max_autotune": True,
-            # Use TRITON for GEMM (General Matrix Multiply) operations tuning only to avoid using operators in libtorch
-            "max_autotune_gemm_backends": "TRITON",
             # Use TRITON backend for convolution operations tuning only to avoid using operators in libtorch
             "max_autotune_conv_backends": "TRITON",
             "aot_inductor.emit_multi_arch_kernel": emit_multi_arch_kernel,
@@ -873,6 +904,7 @@ class CudaBackend(AotiBackend, BackendDetails):
         emulate_precision_casts = True
         max_autotune = True
         autotune_at_compile_time = None
+        gemm_backends_spec = None
         shim_library_path = None
         for spec in compile_specs:
             if spec.key == "platform":
@@ -885,6 +917,11 @@ class CudaBackend(AotiBackend, BackendDetails):
                 autotune_at_compile_time = _on_off_compile_spec_value(spec)
             elif spec.key == "shim_library_path":
                 shim_library_path = spec.value.decode("utf-8")
+            elif spec.key == "max_autotune_gemm_backends":
+                gemm_backends_spec = spec
+        options["max_autotune_gemm_backends"] = _gemm_backends(
+            gemm_backends_spec, platform
+        )
         options["emulate_precision_casts"] = emulate_precision_casts
         options["max_autotune"] = max_autotune
         if autotune_at_compile_time is not None:
