@@ -3115,6 +3115,49 @@ class TestPasses(unittest.TestCase):
                         f"Constant should be contiguous after pass, got strides {modified_const.stride()}",
                     )
 
+    def test_convert_constant_dim_order_parameter(self):
+        """
+        Verify that the convert_constant_dim_order_pass converts a parameter
+        outside the allowed dim orders to contiguous, keeps it a parameter, and
+        leaves a channels-last parameter as it is.
+        """
+
+        class AddParameter(torch.nn.Module):
+            def __init__(self, weight: torch.Tensor):
+                super().__init__()
+                self.weight = torch.nn.Parameter(weight)
+
+            def forward(self, x):
+                return x + self.weight
+
+        weights = {
+            "transposed": (torch.randn(5, 4).t(), True),
+            "channels_last": (
+                torch.randn(2, 3, 4, 5).to(memory_format=torch.channels_last),
+                False,
+            ),
+        }
+        for description, (weight, converted) in weights.items():
+            with self.subTest(description=description):
+                inputs = (torch.randn(weight.shape),)
+                ep = torch.export.export(AddParameter(weight), inputs)
+                modified_ep = (
+                    convert_constant_dim_order_pass.convert_constant_dim_order_pass(
+                        copy.deepcopy(ep)
+                    )
+                )
+
+                torch.testing.assert_close(
+                    ep.module()(*inputs), modified_ep.module()(*inputs)
+                )
+                param = modified_ep.state_dict["weight"]
+                self.assertIsInstance(param, torch.nn.Parameter)
+                self.assertEqual(param.is_contiguous(), converted)
+                placeholder = next(
+                    n for n in modified_ep.graph.nodes if n.name == "p_weight"
+                )
+                self.assertEqual(placeholder.meta["val"].stride(), param.stride())
+
 
 class TestMemoryFormatOpsPassPreserveFormat(unittest.TestCase):
     """
