@@ -823,8 +823,9 @@ def _generate_edge_program(
     program = remove_unused_parameters_pass(program)
 
     if not config._skip_dim_order:
-        # Normalize constants and buffers before MemoryFormatOpsPass rewrites
-        # preserve-format copies, which cannot represent arbitrary dim orders.
+        # Normalize constants, buffers and parameters before MemoryFormatOpsPass
+        # rewrites preserve-format copies, which cannot represent arbitrary dim
+        # orders.
         program = convert_constant_dim_order_pass.convert_constant_dim_order_pass(
             program
         )
