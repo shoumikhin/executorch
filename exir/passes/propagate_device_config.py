@@ -56,8 +56,12 @@ class PropagateDeviceConfig:
     # A dict can be used to set per-method values, keyed by method name.
     skip_h2d_for_method_inputs: Union[bool, Dict[str, bool]] = False
 
-    # When True, device delegate outputs that are directly method outputs
-    # are NOT wrapped with _d2h_copy. The method outputs stay on device.
+    # When True, a device delegate output that the method returns is returned
+    # as is, not through a _d2h_copy, so the method output stays on device.
+    # Other ops that read it still get a host copy. If a host op may write that
+    # copy in place, the method returns the copy, since only it would have the
+    # write, and logs a warning. A host op whose schema is not aten or dim
+    # order counts as one that may write.
     # Useful for cross-method GPU pipelines where the next method consumes
     # GPU tensors directly.
     #

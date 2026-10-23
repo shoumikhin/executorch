@@ -157,7 +157,11 @@ outputs = method([torch.randn(4, 64, device="cuda")])
 ```
 
 Outputs also stay on the device, which is what you want when the next stage of your pipeline is
-also on the GPU.
+also on the GPU. The exception is an output that an operator outside the delegate might change in
+place. It comes back on the host, with a warning at export, because only the host copy would have
+the change. Any operator other than an `aten` or dim order one counts as one that might change
+its inputs, for example a custom or a quantize operator, so an output that one of them also reads
+comes back on the host too.
 
 ### Things worth knowing
 
