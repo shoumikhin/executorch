@@ -5,11 +5,21 @@ on:
     types: [created]
   issues:
     types: [opened]
+  # Review trusted pull requests once when they become reviewable, not on every
+  # push. The reusable workflow skips fork PRs and authors without write access.
+  pull_request:
+    types: [opened, ready_for_review]
 
 jobs:
   claude-code:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (!github.event.pull_request.draft &&
+        github.event.pull_request.user.type != 'Bot' &&
+        !endsWith(github.event.pull_request.user.login, 'bot'))
     uses: pytorch/test-infra/.github/workflows/_claude-code.yml@main
     with:
+      prompt: /pr-review
       additional_claude_args: --allowedTools Skill --effort max
       append_system_prompt: |
         When asked to review a PR, always use the /pr-review skill first.
