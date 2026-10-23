@@ -158,8 +158,8 @@ outputs = method([torch.randn(4, 64, device="cuda")])
 
 Constants that the partitioner leaves outside the delegate, such as weights or buffers the method
 does not change, are not passed by the caller. Their data stays in the program in host memory, so
-they are still copied to the device on every call, once for each delegate that reads them. Keep
-constants inside the delegate to avoid that cost.
+they are still copied to the device on every call. Keep constants inside the delegate to avoid
+that cost.
 
 Outputs also stay on the device, which is what you want when the next stage of your pipeline is
 also on the GPU. The exception is an output that an operator outside the delegate might change in

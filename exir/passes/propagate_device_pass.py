@@ -209,7 +209,9 @@ class PropagateDevicePass(PassBase):
     boundaries based on partitioner-assigned device info.
 
     When a delegate has a target_device CompileSpec (e.g., "cuda:0"):
-    - For each delegate input: insert et_copy._h2d_copy before the delegate call.
+    - For each delegate input: insert et_copy._h2d_copy before the delegate call,
+      or reuse the one an earlier delegate on the same device reads, unless a
+      host op may write the input in place.
       The original input node stays CPU; the h2d_copy output is tagged as device.
     - For each delegate output: insert et_copy._d2h_copy after each getitem,
       or after the call itself when it returns a single tensor.
@@ -273,7 +275,8 @@ class PropagateDevicePass(PassBase):
         target_device_type: schema.DeviceType,
         device_index: int,
     ) -> bool:
-        """Insert H2D copy nodes for each tensor input to a delegate call."""
+        """Copy each tensor input of a delegate call to its device, reusing an
+        earlier copy there unless a host op may write the tensor."""
         changed = False
         new_args = list(node.args)
         for i, arg in enumerate(node.args[1:], start=1):
@@ -348,30 +351,47 @@ class PropagateDevicePass(PassBase):
                     f"so a pass that adds or changes one after to_edge must make "
                     f"it contiguous itself."
                 )
-            if arg_spec.const:
-                logger.warning(
-                    "Constant '%s' (%d bytes) is read by a delegate on %s:%d "
-                    "but is not part of that delegate, so it is copied to the "
-                    "device on every call. Have the partitioner take it into "
-                    "the delegate to avoid that copy.",
-                    arg.name,
-                    arg_spec.nbytes(),
-                    target_device_type.name.lower(),
-                    device_index,
-                )
 
-            with graph_module.graph.inserting_before(node):
-                h2d_node = graph_module.graph.call_function(
-                    torch.ops.et_copy._h2d_copy.default,
-                    (arg,),
+            # Delegates are visited in graph order, so a copy made for an earlier
+            # delegate on this device already comes before this one. It can be
+            # stale when a host op may write the tensor in place.
+            h2d_node = None
+            if not _may_be_written_in_place(arg):
+                h2d_node = next(
+                    (
+                        user
+                        for user in arg.users
+                        if user.target == torch.ops.et_copy._h2d_copy.default
+                        and user.meta["spec"].device == target_device_type
+                        and user.meta["spec"].device_index == device_index
+                    ),
+                    None,
                 )
-                h2d_spec = _copy_output_spec(arg_spec, target_device_type, device_index)
-                h2d_node.meta["spec"] = h2d_spec
-                h2d_node.meta["val"] = arg.meta.get("val")
-                if "tensor_meta" in arg.meta:
-                    h2d_node.meta["tensor_meta"] = arg.meta["tensor_meta"]
-                new_args[i] = h2d_node
-                changed = True
+            if h2d_node is None:
+                with graph_module.graph.inserting_before(node):
+                    h2d_node = graph_module.graph.call_function(
+                        torch.ops.et_copy._h2d_copy.default,
+                        (arg,),
+                    )
+                    h2d_node.meta["spec"] = _copy_output_spec(
+                        arg_spec, target_device_type, device_index
+                    )
+                    h2d_node.meta["val"] = arg.meta.get("val")
+                    if "tensor_meta" in arg.meta:
+                        h2d_node.meta["tensor_meta"] = arg.meta["tensor_meta"]
+                if arg_spec.const:
+                    logger.warning(
+                        "Constant '%s' (%d bytes) is read by a delegate on %s:%d "
+                        "but is not part of that delegate, so it is copied to the "
+                        "device on every call. Have the partitioner take it into "
+                        "the delegate to avoid that copy.",
+                        arg.name,
+                        arg_spec.nbytes(),
+                        target_device_type.name.lower(),
+                        device_index,
+                    )
+            new_args[i] = h2d_node
+            changed = True
 
         node.args = tuple(new_args)
         return changed
@@ -474,11 +494,11 @@ class PropagateDevicePass(PassBase):
     ) -> None:
         """Remove ``_h2d_copy(_d2h_copy(x))`` round-trips that never leave a device.
 
-        H2D and D2H copies are inserted per delegate boundary independently (an
-        H2D before every device delegate input, a D2H after every device delegate
-        output), so two consecutive delegates on the *same* device leave a
-        redundant ``device -> host -> device`` bounce: the first delegate's output
-        is copied to host by a ``_d2h_copy`` and immediately copied back to the
+        H2D and D2H copies are inserted at delegate boundaries (an H2D for each
+        tensor a device reads, a D2H after every device delegate output), so two
+        consecutive delegates on the *same* device leave a redundant
+        ``device -> host -> device`` bounce: the first delegate's output is
+        copied to host by a ``_d2h_copy`` and immediately copied back to the
         same device by a ``_h2d_copy`` feeding the second delegate.
 
         This walks each ``_h2d_copy`` whose input is a ``_d2h_copy`` and, when the
@@ -533,9 +553,11 @@ class PropagateDevicePass(PassBase):
     def call(self, graph_module: torch.fx.GraphModule) -> PassResult:  # noqa: C901
         # Three-pass approach:
         #   Pass 1 – For each delegate with a target_device CompileSpec, insert
-        #            H2D copy nodes before delegate inputs and tag the delegate
-        #            output specs with the target device.  Delegates without a
-        #            target_device are left untouched (no copies, specs stay CPU).
+        #            H2D copy nodes before delegate inputs, one per tensor and
+        #            device unless a host op may write the tensor, and tag the
+        #            delegate output specs with the target device. Delegates
+        #            without a target_device are left untouched (no copies,
+        #            specs stay CPU).
         #   Pass 2 – Insert a D2H copy after each output of a device-tagged
         #            delegate (tracked in device_delegates) so downstream
         #            non-delegated ops receive CPU tensors: after each getitem
