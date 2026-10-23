@@ -18,6 +18,10 @@ import torch
 import torch.utils._pytree as pytree
 from executorch.exir.delegate import executorch_call_delegate
 from executorch.exir.lowered_backend_module import LoweredBackendModule
+from executorch.exir.passes.insert_write_back_for_buffers_pass import (
+    _mutates_input,
+    _schema_is_trusted,
+)
 
 # Re-exported for backward compatibility; the dataclass lives in a lightweight
 # module so that ExecutorchBackendConfig can reference it without importing the
@@ -145,6 +149,35 @@ def _clone_spec_with_device(
     new_spec.init_mem_planning_fields()
     _set_device_on_spec(new_spec, device_type, device_index)
     return new_spec
+
+
+def _schema_is_trusted_with_dim_order(op_schema: torch.FunctionSchema) -> bool:
+    return _schema_is_trusted(op_schema) or op_schema.name.startswith("dim_order_ops::")
+
+
+def _may_be_written_in_place(node: torch.fx.Node) -> bool:
+    """Whether an op that reads *node* may also write it.
+
+    A mutable op left on the host does this once to_executorch has removed
+    auto_functionalized, so a copy of *node* can miss the write. This uses the
+    buffer write-back pass's write test, which trusts only aten schemas.
+    ExecuTorch's own dim order ops are trusted too, so a cast left on the host
+    does not keep a round trip. Only direct readers are checked: views are
+    still copies here, and ReplaceViewCopyWithViewPass checks writes itself
+    before it turns one into an alias. Delegate calls and copies only read
+    their inputs.
+    """
+    readers = (
+        executorch_call_delegate,
+        torch.ops.et_copy._h2d_copy.default,
+        torch.ops.et_copy._d2h_copy.default,
+    )
+
+    return any(
+        user.target not in readers
+        and _mutates_input(user, node, _schema_is_trusted_with_dim_order)
+        for user in node.users
+    )
 
 
 class PropagateDevicePass(PassBase):
@@ -327,8 +360,10 @@ class PropagateDevicePass(PassBase):
         rewires the consumer straight to that device tensor and drops both copies.
         The device comparison is the correctness guard: a genuine cross-device
         move (e.g. ``cuda:0 -> host -> cuda:1``) has differing devices and is left
-        intact. A D2H feeding other (host) consumers keeps those users and is
-        removed only once it becomes dead.
+        intact. So is a round-trip whose host copy a host op writes in place,
+        because the device tensor never sees that write. A D2H feeding other
+        (host) consumers keeps those users and is removed only once it becomes
+        dead.
         """
         h2d = torch.ops.et_copy._h2d_copy.default
         d2h = torch.ops.et_copy._d2h_copy.default
@@ -356,6 +391,7 @@ class PropagateDevicePass(PassBase):
             if (
                 x_spec.device != h2d_spec.device
                 or x_spec.device_index != h2d_spec.device_index
+                or _may_be_written_in_place(src)
             ):
                 continue
 

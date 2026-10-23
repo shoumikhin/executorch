@@ -32,6 +32,7 @@ from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.passes import MemoryPlanningPass
 from executorch.exir.passes.propagate_device_pass import (
     _get_target_device_from_compile_specs,
+    _may_be_written_in_place,
     _parse_device_spec_value,
     PropagateDeviceConfig,
     TARGET_DEVICE_COMPILE_SPEC_KEY,
@@ -140,6 +141,67 @@ class PerAddDeviceDelegatePartitioner(Partitioner):
             tagged_exported_program=exported_program,
             partition_tags=partition_tags,
         )
+
+
+# A mutable op that stays on the host, like a KV cache update. Once
+# to_executorch removes auto_functionalized, it writes its argument in place.
+_test_lib = torch.library.Library("propagate_device_test", "DEF")
+_test_lib.define("add_one(Tensor(a!) x) -> Tensor")
+_test_lib.define("add_one.out(Tensor(a!) x, *, Tensor(b!) out) -> Tensor(b!)")
+
+
+@torch.library.impl(_test_lib, "add_one", "CompositeExplicitAutograd")
+def _add_one(x: torch.Tensor) -> torch.Tensor:
+    x.add_(1)
+    return x.clone()
+
+
+@torch.library.impl(_test_lib, "add_one.out", "CompositeExplicitAutograd")
+def _add_one_out(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    x.add_(1)
+    return out.copy_(x)
+
+
+# A host op that only reads its argument. Its schema is not an aten one, so the
+# pass cannot trust it to declare every write.
+_test_lib.define("double(Tensor x) -> Tensor")
+_test_lib.define("double.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)")
+
+
+@torch.library.impl(_test_lib, "double", "CompositeExplicitAutograd")
+def _double(x: torch.Tensor) -> torch.Tensor:
+    return x * 2
+
+
+@torch.library.impl(_test_lib, "double.out", "CompositeExplicitAutograd")
+def _double_out(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    return out.copy_(x * 2)
+
+
+def _lower_with_host_writer(
+    model: torch.nn.Module,
+    inputs: tuple,
+    devices: List[str],
+    et_config: ExecutorchBackendConfig,
+) -> torch.fx.GraphModule:
+    """Delegate each add of a model that also calls add_one on the host."""
+    edge = to_edge(
+        export(model, inputs),
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    )
+    et = edge.to_backend(PerAddDeviceDelegatePartitioner(devices)).to_executorch(
+        et_config
+    )
+    return et.exported_program().graph_module
+
+
+def _host_writer(gm: torch.fx.GraphModule) -> torch.fx.Node:
+    (writer,) = [
+        n
+        for n in gm.graph.nodes
+        if n.target == torch.ops.propagate_device_test.add_one.out
+    ]
+    return writer
 
 
 class TestPropagateDevicePass(unittest.TestCase):
@@ -492,6 +554,106 @@ class TestPropagateDevicePass(unittest.TestCase):
                     f"[{pipeline}] expected the inter-delegate D2H to be elided "
                     f"(1 boundary D2H), got {len(nodes.d2h_nodes)}",
                 )
+
+    def test_same_device_copies_kept_when_host_op_writes_copy(self):
+        """A host op that writes the host copy of a delegate output in place
+        changes what the next delegate on the same device reads, so that
+        round-trip stays."""
+
+        class Model(torch.nn.Module):
+            def forward(self, x, y):
+                a = x + y
+                torch.ops.propagate_device_test.add_one(a)
+                return a + y
+
+        gm = _lower_with_host_writer(
+            Model(),
+            (torch.randn(2, 2), torch.randn(2, 2)),
+            ["cuda:0", "cuda:0"],
+            ExecutorchBackendConfig(
+                emit_stacktrace=False, enable_non_cpu_memory_planning=True
+            ),
+        )
+        written = _host_writer(gm).args[0]
+        self.assertEqual(written.target, torch.ops.et_copy._d2h_copy.out)
+        second = _collect_device_copy_nodes(gm).delegate_nodes[1]
+        self.assertIn(
+            written,
+            [
+                arg.args[0]
+                for arg in second.args[1:]
+                if arg.target == torch.ops.et_copy._h2d_copy.out
+            ],
+        )
+
+    def test_same_device_copies_kept_when_untrusted_host_op_reads_copy(self):
+        """A host op whose schema is not trusted may write what it reads, as the
+        buffer write-back pass assumes too, so that round-trip stays."""
+
+        class Model(torch.nn.Module):
+            def forward(self, x, y):
+                a = x + y
+                return a + y, torch.ops.propagate_device_test.double(a)
+
+        gm = _lower_with_host_writer(
+            Model(),
+            (torch.randn(2, 2), torch.randn(2, 2)),
+            ["cuda:0", "cuda:0"],
+            ExecutorchBackendConfig(
+                emit_stacktrace=False, enable_non_cpu_memory_planning=True
+            ),
+        )
+        (reader,) = [
+            n
+            for n in gm.graph.nodes
+            if n.target == torch.ops.propagate_device_test.double.out
+        ]
+        read = reader.args[0]
+        self.assertEqual(read.target, torch.ops.et_copy._d2h_copy.out)
+        second = _collect_device_copy_nodes(gm).delegate_nodes[1]
+        self.assertIn(
+            read,
+            [
+                arg.args[0]
+                for arg in second.args[1:]
+                if arg.target == torch.ops.et_copy._h2d_copy.out
+            ],
+        )
+
+    def test_same_device_copies_elided_when_host_op_only_reads_copy(self):
+        """A cast left on the host only reads the host copy. Its edge op, a dim
+        order copy, is one of ExecuTorch's own ops, whose schema the pass
+        trusts, so that round-trip is still elided."""
+
+        class Model(torch.nn.Module):
+            def forward(self, x, y):
+                a = x + y
+                return a + y, a.to(torch.float16)
+
+        gm = _lower_with_host_writer(
+            Model(),
+            (torch.randn(2, 2), torch.randn(2, 2)),
+            ["cuda:0", "cuda:0"],
+            ExecutorchBackendConfig(
+                emit_stacktrace=False, enable_non_cpu_memory_planning=True
+            ),
+        )
+        (cast,) = [
+            n
+            for n in gm.graph.nodes
+            if n.target == torch.ops.dim_order_ops._to_dim_order_copy.out
+        ]
+        self.assertEqual(cast.args[0].target, torch.ops.et_copy._d2h_copy.out)
+        nodes = _collect_device_copy_nodes(gm)
+        self.assertNotIn(
+            torch.ops.et_copy._d2h_copy.out,
+            [h2d.args[0].target for h2d in nodes.h2d_nodes],
+        )
+        # A cast that reinplace plans on top of its input writes it, whatever
+        # its schema says.
+        self.assertFalse(_may_be_written_in_place(cast.args[0]))
+        cast.meta["_share_alloc_with_arg_idx"] = 0
+        self.assertTrue(_may_be_written_in_place(cast.args[0]))
 
     def test_cross_device_copies_preserved(self):
         """A genuine cross-device hand-off (cuda:0 -> cuda:1) between two

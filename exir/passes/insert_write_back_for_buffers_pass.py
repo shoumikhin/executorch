@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import operator
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 from executorch.exir.operator.convert import is_inplace_variant
@@ -164,10 +164,15 @@ def _schema_writes_input(
     return False
 
 
-def _mutates_input(node: torch.fx.Node, input_node: torch.fx.Node) -> bool:
+def _mutates_input(
+    node: torch.fx.Node,
+    input_node: torch.fx.Node,
+    trusted: Callable[[torch.FunctionSchema], bool] = _schema_is_trusted,
+) -> bool:
     """
     Whether this node may mutate the value passed to it as input_node. When we
-    cannot tell we conservatively answer True.
+    cannot tell we conservatively answer True. Only a schema that *trusted*
+    accepts is relied on to mark every write.
     """
     if node.op == "output":
         return False
@@ -177,7 +182,7 @@ def _mutates_input(node: torch.fx.Node, input_node: torch.fx.Node) -> bool:
     if node.op != "call_function":
         return True
     schema = getattr(node.target, "_schema", None)
-    if schema is None or not _schema_is_trusted(schema):
+    if schema is None or not trusted(schema):
         return True
     return _schema_writes_input(node, schema, input_node)
 
