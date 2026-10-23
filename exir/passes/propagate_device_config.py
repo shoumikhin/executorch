@@ -46,10 +46,11 @@ class PropagateDeviceConfig:
     already owns, then copies into it with a host memcpy, which is undefined for device memory.
     """
 
-    # When True, method-level input tensors that feed directly into a device
-    # delegate are NOT wrapped with _h2d_copy. The user must provide tensors
-    # already on the target device. Useful for pipelines where inputs are
-    # pre-staged on GPU. Constants are not passed by the caller, so they are
+    # When True, method-level input tensors that feed a device delegate are NOT
+    # wrapped with _h2d_copy. Every reader of such an input must then be a
+    # delegate on that device, or to_executorch raises. The user must provide
+    # tensors already on the target device. Useful for pipelines where inputs
+    # are pre-staged on GPU. Constants are not passed by the caller, so they are
     # still copied: their data stays in the program on the host. That copy runs
     # on every call, once for each delegate that reads the constant.
     #

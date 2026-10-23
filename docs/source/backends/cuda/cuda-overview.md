@@ -178,6 +178,12 @@ out works, and the snippet above sets it explicitly only to make the requirement
 it to `False` while asking for either skip raises a `ValueError`, because copy insertion happens
 during device-aware memory planning.
 
+**With `skip_h2d_for_method_inputs`, only delegates on that device may read an input.** If an
+operator outside the delegate also reads it, the method returns it, or the method changes it,
+`to_executorch` raises an error instead of adding a copy. Turn the flag off, or have the
+partitioner take those operators. For a mutable buffer, `tag_mutated_buffer` does that, and the
+CUDA partitioner already calls it.
+
 **Inputs must be unplanned**, via `MemoryPlanningPass(alloc_graph_input=False)`. Without it the
 program reserves its own input buffer and the runtime copies the caller's memory into it, so the
 copy comes back at run time. On device memory that copy is a host memcpy into a device pointer,
