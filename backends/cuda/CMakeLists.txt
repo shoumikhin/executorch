@@ -254,10 +254,18 @@ set(_aoti_cuda_shim_sources runtime/shims/memory.cpp
 )
 
 # Only build CUDA-only operator shims when the CUDA toolchain is available.
+set(_aoti_cuda_shims_use_cublas OFF)
 if(NOT EXECUTORCH_BUILD_ROCM AND CMAKE_CUDA_COMPILER)
   list(APPEND _aoti_cuda_shim_sources runtime/shims/int4mm.cu
        runtime/shims/sort.cu runtime/shims/rand.cu
   )
+  # The cuBLAS matrix multiplication shims are Linux only, since the Windows
+  # DLLs load nothing but the driver. aoti_cuda_shims.lib does not list them
+  # either, so a Windows model that needs one fails to link at export.
+  if(NOT WIN32)
+    list(APPEND _aoti_cuda_shim_sources runtime/shims/mm.cu)
+    set(_aoti_cuda_shims_use_cublas ON)
+  endif()
 endif()
 
 add_library(aoti_cuda_shims SHARED ${_aoti_cuda_shim_sources})
@@ -320,6 +328,10 @@ else()
             -Wl,--no-whole-archive
     PUBLIC ${_cuda_runtime_libraries} extension_cuda ${CMAKE_DL_LIBS}
   )
+endif()
+
+if(_aoti_cuda_shims_use_cublas)
+  target_link_libraries(aoti_cuda_shims PRIVATE CUDA::cublasLt)
 endif()
 
 if(NOT _cuda_is_msvc_toolchain)
