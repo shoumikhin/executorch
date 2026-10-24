@@ -124,8 +124,8 @@ _SMALL_GPU_GUARD = threading.local()
 @contextlib.contextmanager
 def _allow_triton_templates_on_small_gpus():
     """Let Inductor use Triton templates on GPUs below its 68-SM floor. This
-    backend autotunes with Triton only, so otherwise a matmul or convolution
-    has no Triton choices left.
+    backend autotunes with Triton only by default, so otherwise a matmul or
+    convolution has no Triton choices left.
 
     Only threads inside this context get the override; other threads get the
     original answer.
@@ -457,6 +457,91 @@ def _on_off_compile_spec_value(spec: CompileSpec) -> bool:
     if value not in ["ON", "OFF"]:
         raise ValueError(f"Invalid {spec.key}: {value}. Expected 'ON' or 'OFF'.")
     return value == "ON"
+
+
+def _gemm_backends(spec: Optional[CompileSpec], max_autotune: bool) -> str:
+    """Matrix multiplication choices autotuning may pick from: TRITON compiles
+    them into the model, ATEN calls cuBLAS at run time.
+
+    ATEN is opt-in because a cuBLAS call is a separate kernel that Inductor
+    cannot fuse with the ops around it. With max_autotune off, Inductor does
+    not autotune and calls the ATen choice, so mm, addmm and bmm run on cuBLAS
+    whatever this says. Float32 ones then run in full precision even with TF32
+    on, as they do with ATEN alone.
+    """
+    if spec is None:
+        return "TRITON"
+    value = spec.value.decode("utf-8").upper().replace(" ", "")
+    backends = set(value.split(","))
+    if not backends <= {"ATEN", "TRITON"}:
+        raise ValueError(
+            f"Invalid {spec.key}: {value}. Expected ATEN, TRITON or ATEN,TRITON."
+        )
+    if "ATEN" in backends and torch.version.hip is not None:
+        raise ValueError(
+            f"ATEN in {spec.key} needs the cuBLAS shims, which this backend "
+            "does not build for ROCm."
+        )
+    if (
+        backends == {"ATEN", "TRITON"}
+        and max_autotune
+        and torch.backends.cuda.matmul.fp32_precision == "tf32"
+    ):
+        # Autotuning times cuBLAS through torch.mm, which follows TF32, but the
+        # shims run float32 in full precision, so it could keep a cuBLAS call
+        # that is slower than it measured. ATEN alone is not timed.
+        raise ValueError(
+            f"ATEN,TRITON in {spec.key} times cuBLAS with TF32 on, but the "
+            "shims run float32 matrix multiplications in full precision. Turn "
+            'TF32 off with torch.set_float32_matmul_precision("highest"), '
+            "which leaves float16 and bfloat16 unchanged, or use ATEN or "
+            "TRITON alone."
+        )
+    return value
+
+
+_SHIMS = threading.local()
+
+
+def _drop_aten_choices_without_shims(choices):
+    """Drops autotuning's ATen choices for ops this backend has no shim for,
+    while another choice is left. Otherwise exporting such an op would fail
+    only when the ATen choice wins the timing, so on some GPUs and not others.
+    """
+    shims = getattr(_SHIMS, "names", None)
+    if shims is None:
+        return choices
+    from torch._inductor import select_algorithm
+    from torch._inductor.codegen.cpp_wrapper_cpu import CppWrapperCpu
+
+    def has_shim(choice) -> bool:
+        if not isinstance(choice, select_algorithm.ExternKernelCaller):
+            return True
+        kernel = choice.choice.cpp_kernel_name
+        return (
+            kernel is not None
+            and "::" in kernel
+            and CppWrapperCpu.get_c_shim_func_name(kernel, "cuda") in shims
+        )
+
+    return [choice for choice in choices if has_shim(choice)] or choices
+
+
+@contextlib.contextmanager
+def _only_aten_choices_with_shims(shims):
+    """Applies _drop_aten_choices_without_shims to the autotuning on this
+    thread. Other threads get every choice."""
+    from torch._inductor import select_algorithm
+
+    cache = select_algorithm.get_algorithm_selector_cache()
+    if _drop_aten_choices_without_shims not in cache.preprocessing_fns:
+        select_algorithm.add_preprocessing_fn(_drop_aten_choices_without_shims)
+    previous = getattr(_SHIMS, "names", None)
+    _SHIMS.names = shims
+    try:
+        yield
+    finally:
+        _SHIMS.names = previous
 
 
 CUDA_GRAPH_AUTOTUNE_TIMING_COMPILE_SPEC = "cuda_graph_autotune_timing"
@@ -860,8 +945,6 @@ class CudaBackend(AotiBackend, BackendDetails):
             ),
             # Enable maximum automatic tuning for optimal performance
             "max_autotune": True,
-            # Use TRITON for GEMM (General Matrix Multiply) operations tuning only to avoid using operators in libtorch
-            "max_autotune_gemm_backends": "TRITON",
             # Use TRITON backend for convolution operations tuning only to avoid using operators in libtorch
             "max_autotune_conv_backends": "TRITON",
             "aot_inductor.emit_multi_arch_kernel": emit_multi_arch_kernel,
@@ -873,6 +956,7 @@ class CudaBackend(AotiBackend, BackendDetails):
         emulate_precision_casts = True
         max_autotune = True
         autotune_at_compile_time = None
+        gemm_backends_spec = None
         shim_library_path = None
         for spec in compile_specs:
             if spec.key == "platform":
@@ -885,6 +969,11 @@ class CudaBackend(AotiBackend, BackendDetails):
                 autotune_at_compile_time = _on_off_compile_spec_value(spec)
             elif spec.key == "shim_library_path":
                 shim_library_path = spec.value.decode("utf-8")
+            elif spec.key == "max_autotune_gemm_backends":
+                gemm_backends_spec = spec
+        options["max_autotune_gemm_backends"] = _gemm_backends(
+            gemm_backends_spec, max_autotune
+        )
         options["emulate_precision_casts"] = emulate_precision_casts
         options["max_autotune"] = max_autotune
         if autotune_at_compile_time is not None:
@@ -940,6 +1029,9 @@ class CudaBackend(AotiBackend, BackendDetails):
         explicitly opt in (currently Qwen3.5 MoE) get it. Other models go
         through the unmodified AOTI codepath, which avoids regressions in
         their cuda CI exports.
+
+        The filter on autotuning's ATen choices applies only when
+        max_autotune_gemm_backends asks for ATEN.
         """
         # Parse compile_specs for low_memory_mode (default OFF). compile_specs
         # may be None when called without specs (parity with base default).
@@ -947,6 +1039,7 @@ class CudaBackend(AotiBackend, BackendDetails):
         # On ROCm a failed capture invalidates the stream the rest of the
         # compile runs on (hipErrorStreamCaptureInvalidated).
         cuda_graph_autotune_timing = torch.version.hip is None
+        aten_gemms = False
         for spec in compile_specs or []:
             if spec.key == "low_memory_mode":
                 mode = spec.value.decode("utf-8").upper()
@@ -957,6 +1050,8 @@ class CudaBackend(AotiBackend, BackendDetails):
                 low_memory_mode = mode
             elif spec.key == CUDA_GRAPH_AUTOTUNE_TIMING_COMPILE_SPEC:
                 cuda_graph_autotune_timing = _on_off_compile_spec_value(spec)
+            elif spec.key == "max_autotune_gemm_backends":
+                aten_gemms = b"ATEN" in spec.value.upper()
         cell_layout = any(
             spec.key == OFFGRAPH_KV_COMPILE_SPEC
             and parse_offgraph_kv_manifest(spec.value)["layout"] == "cell"
@@ -976,6 +1071,14 @@ class CudaBackend(AotiBackend, BackendDetails):
                 # On ROCm, is_big_gpu gates on architecture, not SM count.
                 if torch.version.hip is None:
                     stack.enter_context(_allow_triton_templates_on_small_gpus())
+                # Keep autotuning's ATen choices to the ops that have a shim,
+                # so whether an export succeeds does not depend on timing.
+                if aten_gemms:
+                    stack.enter_context(
+                        _only_aten_choices_with_shims(
+                            set(cls.get_supported_fallback_kernels())
+                        )
+                    )
                 if low_memory_mode == "ON":
                     # Force AOTI's mutated-buffer clones onto CPU during
                     # compile so we stay under tight GPU memory caps (e.g.
