@@ -5,8 +5,8 @@ links the generated wrapper against this file, so it has to advertise every shim
 the wrapper can reference. It is checked in because the build that produces the DLL
 does not run on the machines that lower for Windows.
 
-Regenerate it whenever a shim is added, which in practice means whenever the PyTorch
-pin moves and the generated wrapper starts calling something new:
+Regenerate it whenever a shim is added, either by the backend or because the PyTorch
+pin moved and the generated wrapper starts calling something new:
 
 ```
 nm --defined-only aoti_cuda_shims.lib \

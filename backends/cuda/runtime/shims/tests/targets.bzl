@@ -2,7 +2,7 @@ load("@fbsource//xplat/executorch/build:runtime_wrapper.bzl", "runtime")
 load("@fbcode_macros//build_defs:cpp_unittest.bzl", "cpp_unittest")
 load("@fbcode_macros//build_defs/lib:re_test_utils.bzl", "re_test_utils")
 
-def cuda_shim_cpp_unittest(name):
+def cuda_shim_cpp_unittest(name, extra_deps = []):
     cpp_unittest(
         name = "test_" + name,
         srcs = [
@@ -13,7 +13,7 @@ def cuda_shim_cpp_unittest(name):
             "//executorch/backends/aoti:aoti_common_slim",
             "//executorch/runtime/core:core",
             "//executorch/runtime/platform:platform",
-        ],
+        ] + extra_deps,
 
         external_deps = [
             ("cuda", None, "cuda-lazy"),
@@ -47,6 +47,10 @@ def define_common_targets(is_fbcode = False):
     cuda_shim_cpp_unittest("aoti_torch_new_tensor_handle")
     cuda_shim_cpp_unittest("aoti_torch_item_bool")
     cuda_shim_cpp_unittest("aoti_torch_assign_tensors_out")
+    cuda_shim_cpp_unittest(
+        "aoti_torch_cuda_mm_out",
+        extra_deps = ["//executorch/backends/aoti/slim/cuda:guard"],
+    )
 
     cpp_unittest(
         name = "test_op__device_copy",

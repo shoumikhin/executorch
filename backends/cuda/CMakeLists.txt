@@ -256,7 +256,12 @@ set(_aoti_cuda_shim_sources runtime/shims/memory.cpp
 # Only build CUDA-only operator shims when the CUDA toolchain is available.
 if(NOT EXECUTORCH_BUILD_ROCM AND CMAKE_CUDA_COMPILER)
   list(APPEND _aoti_cuda_shim_sources runtime/shims/int4mm.cu
-       runtime/shims/sort.cu runtime/shims/rand.cu
+       runtime/shims/mm.cu runtime/shims/sort.cu runtime/shims/rand.cu
+  )
+  # mm.cu loads cuBLASLt on the first matrix multiplication instead of linking
+  # it, so a model that never calls the cuBLAS shims does not need it installed.
+  set_source_files_properties(
+    runtime/shims/mm.cu PROPERTIES COMPILE_DEFINITIONS ET_LOAD_CUBLASLT
   )
 endif()
 
