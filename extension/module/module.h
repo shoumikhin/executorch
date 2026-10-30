@@ -598,6 +598,8 @@ class Module {
    * @returns An Error to indicate success or failure.
    *
    * @note Only Tensor outputs are currently supported for setting.
+   * @note The tensor must be sized for the output's largest shape, not only
+   * its current one. A smaller tensor fails with Error::InvalidArgument.
    */
   ET_NODISCARD
   runtime::Error set_output(
@@ -615,6 +617,8 @@ class Module {
    * @returns An Error to indicate success or failure.
    *
    * @note Only Tensor outputs are currently supported for setting.
+   * @note The tensor must be sized for the output's largest shape, not only
+   * its current one. A smaller tensor fails with Error::InvalidArgument.
    */
   ET_NODISCARD
   inline runtime::Error set_output(
@@ -636,6 +640,8 @@ class Module {
    *
    * @note Only Tensor outputs are currently supported for setting.
    * @note Will fail for outputs that are memory-planned or constants.
+   * @note Each tensor must be sized for its output's largest shape, not only
+   * its current one. A smaller tensor fails with Error::InvalidArgument.
    */
   ET_NODISCARD
   runtime::Error set_outputs(
@@ -651,6 +657,8 @@ class Module {
    *
    * @note Only Tensor outputs are currently supported for setting.
    * @note Will fail for outputs that are memory-planned or constants.
+   * @note Each tensor must be sized for its output's largest shape, not only
+   * its current one. A smaller tensor fails with Error::InvalidArgument.
    */
   ET_NODISCARD
   inline runtime::Error set_outputs(

@@ -575,7 +575,9 @@ NS_SWIFT_NAME(Module)
  * Sets the output buffer for the "forward" method at index 0.
  *
  * Only tensor outputs are supported. The provided value must wrap a tensor
- * compatible with the method’s output slot.
+ * compatible with the method’s output slot, sized for the output's largest
+ * shape, not only its current one. A smaller tensor fails with
+ * ExecuTorchErrorCodeInvalidArgument.
  *
  * @param value The output buffer (must wrap a tensor).
  * @param error On failure, set to an NSError describing the issue.
@@ -588,7 +590,9 @@ NS_SWIFT_NAME(Module)
  * Sets the output buffer for the "forward" method at the specified index.
  *
  * Only tensor outputs are supported. The provided value must wrap a tensor
- * compatible with the method’s output slot.
+ * compatible with the method’s output slot, sized for the output's largest
+ * shape, not only its current one. A smaller tensor fails with
+ * ExecuTorchErrorCodeInvalidArgument.
  *
  * @param value The output buffer (must wrap a tensor).
  * @param index Zero-based output index.
@@ -603,7 +607,9 @@ NS_SWIFT_NAME(Module)
  * Sets the output buffer for the specified method at index 0.
  *
  * Only tensor outputs are supported. The provided value must wrap a tensor
- * compatible with the method’s output slot.
+ * compatible with the method’s output slot, sized for the output's largest
+ * shape, not only its current one. A smaller tensor fails with
+ * ExecuTorchErrorCodeInvalidArgument.
  *
  * @param value The output buffer (must wrap a tensor).
  * @param methodName The method name.
@@ -619,7 +625,9 @@ NS_SWIFT_NAME(Module)
  *
  * The module retains the provided value to keep its backing storage alive
  * until the value is overwritten or the module is deallocated.
- * Only tensor outputs are supported.
+ * Only tensor outputs are supported. The tensor must be sized for the
+ * output's largest shape, not only its current one. A smaller tensor fails
+ * with ExecuTorchErrorCodeInvalidArgument.
  *
  * @param value The output buffer (must wrap a tensor).
  * @param methodName The method name.

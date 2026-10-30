@@ -286,7 +286,8 @@ public extension Module {
   /// Sets the output location for a method at the specified index.
   ///
   /// Only tensor outputs are supported. The provided value must wrap a tensor
-  /// with compatible shape and data type for the method’s output slot.
+  /// with a compatible data type, sized for the output's largest shape, not
+  /// only its current one. A smaller tensor throws an invalid argument error.
   ///
   /// - Parameters:
   ///   - value: The output buffer as a `ValueConvertible` (tensor).
