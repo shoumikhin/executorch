@@ -565,7 +565,8 @@ class TestCoreMLPartitioner(unittest.TestCase):
         coremltools fails some forms of ``index_put``, such as
         ``y[:, idx] = v`` with two entries in ``idx``, or writes them to the
         wrong place, so the partitioner refuses those, and they run on the
-        portable backend.
+        portable backend.  With lower_full_graph=True, lowering fails and says
+        why.
         """
 
         class Scatter(torch.nn.Module):
@@ -644,6 +645,30 @@ class TestCoreMLPartitioner(unittest.TestCase):
                     program = Runtime.get().load_program(edge.to_executorch().buffer)
                     out = program.load_method("forward").execute(inputs)[0]
                     self.assertTrue(torch.allclose(out, model(*inputs), atol=1e-2))
+
+        class BoolWrite(torch.nn.Module):
+            def __init__(self, index):
+                super().__init__()
+                self.register_buffer("index", index)
+
+            def forward(self, x, a):
+                return torch.ops.aten.index_put(x > 0.5, [None, self.index], a > 0.5)
+
+        for model, inputs, reason in (
+            (Scatter3d(), scatter3d_inputs, "values that vary before the last index"),
+            (
+                BoolWrite(torch.tensor([2])),
+                scatter_inputs[:2],
+                "minimum_deployment_target below iOS 18",
+            ),
+            # A bool write that a later target would not fix gives its own reason.
+            (BoolWrite(torch.tensor([0, 2])), scatter_inputs[:2], "other than an int"),
+        ):
+            with self.assertRaisesRegex(NotImplementedError, reason):
+                executorch.exir.to_edge_transform_and_lower(
+                    torch.export.export(model, inputs, strict=True),
+                    partitioner=[CoreMLPartitioner(lower_full_graph=True)],
+                )
         # With a batch size known only at run time, the write that stays in
         # Core ML above goes to the CPU too.
         batch = torch.export.Dim("batch", min=2, max=8)
