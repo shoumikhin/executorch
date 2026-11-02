@@ -17,6 +17,9 @@ from typing import Any, Dict, final, List, Optional, Tuple, Union
 
 import coremltools as ct
 import coremltools.optimize as cto
+from coremltools.converters.mil import Builder as mb
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 from executorch.backends.apple.coreml import executorchcoreml
 from executorch.backends.apple.coreml.compiler.enumerated_shape_utils import (
     _get_ct_inputs,
@@ -65,6 +68,41 @@ def _gathers_sharing_a_weight(mlmodel: ct.models.MLModel) -> List[str]:
         if gathers and len(gathers) < len(ops):
             shared += [op.name for op in gathers]
     return shared
+
+
+@register_pass(namespace="executorch", name="copy_reused_outputs")
+class _CopyReusedOutputs(AbstractGraphPass):
+    """
+    Gives each output of the program a value of its own.
+
+    coremltools converts ops such as clone into nothing, and keeps a tile that
+    changes nothing, such as one from a same-shape expand, only when it makes
+    an output. So a partition can return one of its own inputs, or one value
+    twice, directly or through such a tile. Core ML then hands back one of
+    those outputs wrong, such as all zeros or the bytes of another output.
+    """
+
+    def apply(self, prog):
+        for function in prog.functions.values():
+            seen = set(function.inputs.values())
+            outputs = []
+            for output in function.outputs:
+                if (
+                    output.op is not None
+                    and output.op.op_type == "tile"
+                    and output.op.x.sym_type == output.sym_type
+                ):
+                    output = output.op.x
+                if output in seen:
+                    with function:
+                        copy = mb.identity(x=output)
+                    # coremltools wants every op to carry the source program's
+                    # scopes, which set_outputs, unlike a var replacement, skips.
+                    function._copy_scope_info(output, copy)
+                    output = copy
+                seen.add(output)
+                outputs.append(output)
+            function.set_outputs(outputs)
 
 
 class COMPILE_SPEC_KEYS(Enum):
@@ -565,6 +603,7 @@ class CoreMLBackend(BackendDetails):
         )
         compute_units = CoreMLBackend.compute_unit_from_compile_specs(compile_specs)
         pass_pipeline = CoreMLBackend.pass_pipeline_from_compile_specs(compile_specs)
+        pass_pipeline.append_pass("executorch::copy_reused_outputs")
         enumerated_shapes = CoreMLBackend.enumerated_shapes_from_compile_specs(
             compile_specs
         )

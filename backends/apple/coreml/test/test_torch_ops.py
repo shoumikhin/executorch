@@ -50,9 +50,15 @@ class TestTorchOps(unittest.TestCase):
         runtime = Runtime.get()
         program = runtime.load_program(executorch_program.buffer)
         method = program.load_method("forward")
-        et_outputs = method.execute(example_inputs)[0]
+        et_outputs = method.execute(example_inputs)
         eager_outputs = eager_program(*example_inputs)
-        self.assertTrue(torch.allclose(et_outputs, eager_outputs, atol=atol, rtol=rtol))
+        if isinstance(eager_outputs, torch.Tensor):
+            eager_outputs = (eager_outputs,)
+        self.assertEqual(len(et_outputs), len(eager_outputs))
+        for et_output, eager_output in zip(et_outputs, eager_outputs):
+            self.assertTrue(
+                torch.allclose(et_output, eager_output, atol=atol, rtol=rtol)
+            )
 
     def test_dequantize_affine_b4w_embedding(self):
         model, example_inputs = self._get_test_model()
@@ -298,14 +304,30 @@ class TestTorchOps(unittest.TestCase):
         self._compare_outputs(et_prog, model, example_inputs)
 
     def test__clone_dim_order_contiguous(self):
+        """
+        The clones convert to nothing, so the Core ML program returns its own
+        input, and one value twice, which Core ML used to return wrong.
+        """
+
         class Model(torch.nn.Module):
             def forward(self, x):
-                return torch.ops.dim_order_ops._clone_dim_order(
-                    x, dim_order=[0, 1, 2, 3]
+                y = x * 2
+                return (
+                    torch.ops.dim_order_ops._clone_dim_order(x, dim_order=[0, 1, 2, 3]),
+                    y,
+                    torch.ops.dim_order_ops._clone_dim_order(y, dim_order=[0, 1, 2, 3]),
                 )
 
         model, example_inputs = Model(), (torch.randn(1, 3, 8, 8),)
         ep = torch.export.export(model, example_inputs)
+        mlmodel = CoreMLBackend._convert_to_mlmodel(
+            executorch.exir.to_edge(ep).exported_program(),
+            CoreMLBackend.generate_compile_specs(),
+        )
+        description = mlmodel.get_spec().description
+        outputs = [output.name for output in description.output]
+        self.assertEqual(len(set(outputs)), len(outputs))
+        self.assertFalse(set(outputs) & {i.name for i in description.input})
         delegated_program = executorch.exir.to_edge_transform_and_lower(
             ep,
             partitioner=[self._coreml_partitioner()],
@@ -318,6 +340,48 @@ class TestTorchOps(unittest.TestCase):
                 ], f"Got unexpected node target after delegation: {node.target.__name__}"
         et_prog = delegated_program.to_executorch()
         self._compare_outputs(et_prog, model, example_inputs)
+
+    def test_same_shape_expand_output(self):
+        """
+        coremltools keeps a same-shape expand as a tile when it makes an
+        output, and Core ML on the CPU then hands back the value it expands
+        wrong, as for the scale_tril that MultivariateNormal returns next to
+        its expand. An expand that changes the shape stays a tile.
+        """
+
+        class Model(torch.nn.Module):
+            def __init__(self, size):
+                super().__init__()
+                self.size = size
+
+            def forward(self, x):
+                y = x * 2
+                return y, y.expand(self.size, -1, -1)
+
+        # Core ML returns these outputs right with ComputeUnit.ALL, and in
+        # float16, where each output is a cast.
+        compile_specs = CoreMLBackend.generate_compile_specs(
+            compute_unit=ct.ComputeUnit.CPU_ONLY,
+            compute_precision=ct.precision.FLOAT32,
+        )
+        example_inputs = (torch.randn(1, 3, 8),)
+        for size, op_type in ((1, "identity"), (2, "tile")):
+            with self.subTest(size=size):
+                model = Model(size)
+                ep = torch.export.export(model, example_inputs)
+                mlmodel = CoreMLBackend._convert_to_mlmodel(
+                    executorch.exir.to_edge(ep).exported_program(), compile_specs
+                )
+                outputs = mlmodel._mil_program.functions["main"].outputs
+                self.assertEqual(
+                    [output.op.op_type for output in outputs], ["mul", op_type]
+                )
+                delegated_program = executorch.exir.to_edge_transform_and_lower(
+                    ep, partitioner=[CoreMLPartitioner(compile_specs=compile_specs)]
+                )
+                self._compare_outputs(
+                    delegated_program.to_executorch(), model, example_inputs
+                )
 
     def test_gelu_tanh(self):
         """
