@@ -963,15 +963,17 @@ class CoreMLPartitioner(Partitioner):
         is_supported: Callable[[Any, torch.fx.Node], bool],
     ) -> List[torch._ops.OpOverload]:
         """Drops every kept op that partition() moves out of CoreML at some call
-        for a uint8 or int8 tensor, since the portable kernels may have no
-        kernel for it. An op skipped by name stays kept.
+        for a uint8 or int8 tensor, or that CoreML rejects once the program is
+        decomposed, since the portable kernels may have no kernel for it. An op
+        skipped by name stays kept.
 
         partition() sees the program once lowering decomposes the ops that are
-        not kept. That can change which ops read a uint8 or int8 tensor from
-        outside of CoreML. So this decomposes the program the same way and finds
-        the calls partition() leaves out, again after each drop that changes the
-        decomposition. It does not see transform passes, or the ops an earlier
-        partitioner takes.
+        not kept. That can make new calls of a kept op that CoreML rejects, such
+        as the matmul of a bfloat16 linear, or change which ops read a uint8 or
+        int8 tensor from outside of CoreML. So this decomposes the program the
+        same way and finds the calls partition() leaves out, again after each
+        drop that changes the decomposition. It does not see transform passes,
+        or the ops an earlier partitioner takes.
         """
         kept_inside = self._placeholders_kept_inside(ep)
         skip = set(self.skip_ops_for_coreml_delegation)
@@ -1014,7 +1016,11 @@ class CoreMLPartitioner(Partitioner):
                 _, left_out = _propose_partitions(
                     graph_module, support, kept_inside, self._targets_ios18()
                 )
-            late = {node.target for node in calls if node in left_out}
+            late = {
+                node.target
+                for node in calls
+                if node in left_out or (decomposed and not is_supported(None, node))
+            }
             if not late:
                 break
             for op in late:
