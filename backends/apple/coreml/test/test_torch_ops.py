@@ -9,6 +9,7 @@ import coremltools as ct
 import executorch.exir
 
 import torch
+from coremltools.converters.mil.mil import types
 
 from executorch.backends.apple.coreml.compiler import CoreMLBackend
 from executorch.backends.apple.coreml.partition import CoreMLPartitioner
@@ -316,6 +317,72 @@ class TestTorchOps(unittest.TestCase):
                 ], f"Got unexpected node target after delegation: {node.target.__name__}"
         et_prog = delegated_program.to_executorch()
         self._compare_outputs(et_prog, model, example_inputs)
+
+    def test_fills_keep_their_dtype(self):
+        """
+        coremltools makes full without a dtype, zeros and new_zeros as float,
+        ones_like as float from iOS 16, zeros_like with the dtype of its input,
+        and full_like, new_full, fill and scalar_tensor with the type of their
+        fill value, instead of the dtype torch gives them. nn.MultiheadAttention
+        turns a bool mask into a float one with zeros_like(mask, dtype=...).
+        """
+
+        class Fills(torch.nn.Module):
+            def forward(self, ids, half):
+                ones = torch.ones_like(ids) + ids.new_zeros((2, 3))
+                twos = ids.new_full((2, 3), 2.0) + torch.empty_like(ids).fill_(0.0)
+                zeros = torch.zeros((2, 3), dtype=torch.long) + torch.zeros_like(ids)
+                count = torch.scalar_tensor(1001.0, dtype=torch.long)
+                ints = (ids + ones + twos + zeros + torch.full((2, 3), 1)) * count
+                flags = torch.where(ids > 0, torch.full((2, 3), True), ids > 1)
+                return (
+                    ints,
+                    flags,
+                    half * torch.ones_like(half) + torch.zeros_like(half),
+                )
+
+        class Attention(torch.nn.MultiheadAttention):
+            def forward(self, x, mask):
+                return super().forward(x, x, x, attn_mask=mask, need_weights=False)[0]
+
+        fills = torch.export.export(
+            Fills(), (torch.arange(6).reshape(2, 3), torch.rand(2, 3).half())
+        )
+        program = ct.convert(
+            fills.run_decompositions({}),
+            convert_to="milinternal",
+            compute_precision=ct.precision.FLOAT32,
+            minimum_deployment_target=ct.target.iOS16,
+        )
+        self.assertEqual(
+            [output.dtype for output in program.functions["main"].outputs],
+            [types.int32, types.bool, types.fp16],
+        )
+        model = Attention(16, 2, batch_first=True).eval()
+        example_inputs = (
+            torch.randn(1, 6, 16),
+            torch.ones(6, 6, dtype=torch.bool).triu(1),
+        )
+        attention = torch.export.export(model, example_inputs)
+        program = ct.convert(attention.run_decompositions({}), convert_to="milinternal")
+        masks = [
+            op.outputs[0].dtype
+            for op in program.functions["main"].operations
+            if op.name.startswith("zeros_like")
+        ]
+        self.assertTrue(masks and all(types.is_float(dtype) for dtype in masks))
+        delegated_program = executorch.exir.to_edge_transform_and_lower(
+            attention, partitioner=[CoreMLPartitioner()]
+        )
+        self.assertEqual(
+            [
+                node.target.__name__
+                for node in delegated_program.exported_program().graph.nodes
+                if node.op == "call_function"
+            ],
+            ["executorch_call_delegate", "getitem"],
+        )
+        self._compare_outputs(delegated_program.to_executorch(), model, example_inputs)
 
     def test_dequantize_affine_below_ios18_raises_with_hint(self):
         """
