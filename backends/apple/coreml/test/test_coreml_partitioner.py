@@ -7,6 +7,7 @@ import io
 import logging
 import sys
 import unittest
+from unittest import mock
 
 import coremltools as ct
 
@@ -16,7 +17,10 @@ import torch
 import torchvision
 
 from executorch.backends.apple.coreml.compiler import CoreMLBackend
-from executorch.backends.apple.coreml.partition import CoreMLPartitioner
+from executorch.backends.apple.coreml.partition import (
+    coreml_partitioner,
+    CoreMLPartitioner,
+)
 from executorch.backends.apple.coreml.test.test_coreml_utils import (
     IS_VALID_TEST_RUNTIME,
 )
@@ -52,6 +56,20 @@ if _TEST_RUNTIME:
 
 class TestCoreMLPartitioner(unittest.TestCase):
     edge_compile_config = executorch.exir.EdgeCompileConfig()
+
+    def _lower_with_one_search(self, ep, partitioner):
+        """Lowers ep, checking that partitions are searched for once, since
+        each search is slow on a large model."""
+        with mock.patch.object(
+            coreml_partitioner,
+            "CapabilityBasedPartitioner",
+            wraps=coreml_partitioner.CapabilityBasedPartitioner,
+        ) as search:
+            edge = executorch.exir.to_edge_transform_and_lower(
+                ep, partitioner=[partitioner]
+            )
+        self.assertEqual(search.call_count, 1)
+        return edge
 
     def test_add_sub_skip_mm(self):
         class Model(torch.nn.Module):
@@ -687,6 +705,360 @@ class TestCoreMLPartitioner(unittest.TestCase):
             if n.op == "call_function"
         ]
         self.assertEqual(op_names.count("aten.index_put.default"), 2)
+
+    def test_int8_output(self):
+        """
+        The Core ML delegate cannot return an int8 tensor: below iOS 26
+        coremltools computes it as int32, without the int8 wraparound, and from
+        iOS 26 it makes an int8 array, which the delegate does not read.  So
+        an op that makes one that is read outside Core ML, here the model
+        output, runs on the CPU.  So does an op that hands one out through a
+        getitem, which always stays with the op.
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                return (x * 2).to(torch.int8)
+
+        class Split(torch.nn.Module):
+            def forward(self, x):
+                return (x * 2).to(torch.int8).split(2, dim=1)[0]
+
+        # Small integers, which Core ML's float16 math keeps exact.
+        x = torch.randint(-50, 50, (1, 4, 4, 4)).float()
+        for model in (Model().eval(), Split().eval()):
+            with self.subTest(model=type(model).__name__):
+                ep = torch.export.export(model, (x,), strict=True)
+                edge = self._lower_with_one_search(ep, CoreMLPartitioner())
+                op_names = [
+                    n.target.__name__
+                    for n in edge.exported_program().graph.nodes
+                    if n.op == "call_function"
+                ]
+                self.assertIn("executorch_call_delegate", op_names)
+                self.assertIn("dim_order_ops._to_dim_order_copy.default", op_names)
+                buffer = edge.to_executorch().buffer
+                if _TEST_RUNTIME:
+                    program = Runtime.get().load_program(buffer)
+                    out = program.load_method("forward").execute((x,))[0]
+                    self.assertTrue(torch.equal(out, model(x)))
+                with self.assertRaisesRegex(NotImplementedError, "makes an int8"):
+                    executorch.exir.to_edge_transform_and_lower(
+                        ep, partitioner=[CoreMLPartitioner(lower_full_graph=True)]
+                    )
+
+    def test_int8_input_is_read_outside_the_delegate(self):
+        """
+        Core ML cannot take a uint8 or int8 input, so the ops that read an int8
+        image stay on the CPU up to its conversion to float, and the float ops
+        after it are still delegated.  With lower_full_graph=True, lowering
+        fails and names the input.
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, image):
+                return torch.relu(image.permute(2, 0, 1).float() / 127.0 - 0.25)
+
+        model = Model().eval()
+        x = torch.randint(-128, 128, (8, 8, 3), dtype=torch.int8)
+        ep = torch.export.export(model, (x,), strict=True)
+        edge = executorch.exir.to_edge_transform_and_lower(
+            ep, partitioner=[CoreMLPartitioner()]
+        )
+        op_names = [
+            n.target.__name__
+            for n in edge.exported_program().graph.nodes
+            if n.op == "call_function"
+        ]
+        self.assertIn("aten.permute_copy.default", op_names)
+        self.assertIn("dim_order_ops._to_dim_order_copy.default", op_names)
+        self.assertIn("executorch_call_delegate", op_names)
+        for name in ("aten.div.Tensor", "aten.sub.Tensor", "aten.relu.default"):
+            self.assertNotIn(name, op_names)
+        buffer = edge.to_executorch().buffer
+        if _TEST_RUNTIME:
+            program = Runtime.get().load_program(buffer)
+            out = program.load_method("forward").execute((x,))[0]
+            self.assertTrue(torch.allclose(out, model(x), atol=1e-2))
+        with self.assertRaisesRegex(NotImplementedError, "image \\(torch\\.int8\\)"):
+            executorch.exir.to_edge_transform_and_lower(
+                ep, partitioner=[CoreMLPartitioner(lower_full_graph=True)]
+            )
+
+    def test_uint8_input_read_by_an_op_without_a_cpu_kernel(self):
+        """
+        A reflect pad that reads a uint8 input runs on the CPU.  Core ML keeps
+        pad whole, but pad is not a core ATen op and has no portable kernel, so
+        it is decomposed there.  Below iOS 18 the index math it decomposes into
+        runs on the CPU too, since it would leave Core ML a partition with no
+        inputs.
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, image):
+                image = torch.nn.functional.pad(image, (1, 1, 1, 1), mode="reflect")
+                return image.float() / 255.0
+
+        model = Model().eval()
+        x = torch.randint(0, 256, (1, 3, 8, 8), dtype=torch.uint8)
+        ep = torch.export.export(model, (x,), strict=True)
+        edge = executorch.exir.to_edge_transform_and_lower(
+            ep, partitioner=[CoreMLPartitioner()]
+        )
+        op_names = [
+            n.target.__name__
+            for n in edge.exported_program().graph.nodes
+            if n.op == "call_function"
+        ]
+        self.assertIn("aten.arange.start_step", op_names)
+        self.assertIn("executorch_call_delegate", op_names)
+        buffer = edge.to_executorch().buffer
+        if _TEST_RUNTIME:
+            program = Runtime.get().load_program(buffer)
+            out = program.load_method("forward").execute((x,))[0]
+            self.assertTrue(torch.allclose(out, model(x), atol=1e-2))
+
+    def test_uint8_input_with_dynamic_shape(self):
+        """
+        With a dynamic height, the index math of a decomposed roll reads only
+        a symbolic size, which Core ML cannot take as an input, so it runs on
+        the CPU too, also from iOS 18, where a partition with no inputs at all
+        may stay in Core ML.  So do a reshape to a size read from the uint8
+        input, and a scale computed from it.
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, image):
+                rolled = torch.roll(image, 1, 2).float() / 255.0
+                scaled = rolled * (image.shape[2] / 8)
+                return scaled.reshape(1, 3 * image.shape[2], 8)
+
+        model = Model().eval()
+        x = torch.randint(0, 256, (1, 3, 8, 8), dtype=torch.uint8)
+        ep = torch.export.export(
+            model,
+            (x,),
+            dynamic_shapes=({2: torch.export.Dim("height", min=4, max=64)},),
+            strict=True,
+        )
+        compile_specs = CoreMLBackend.generate_compile_specs(
+            minimum_deployment_target=ct.target.iOS18
+        )
+        edge = self._lower_with_one_search(
+            ep, CoreMLPartitioner(compile_specs=compile_specs)
+        )
+        op_names = [
+            n.target.__name__
+            for n in edge.exported_program().graph.nodes
+            if n.op == "call_function"
+        ]
+        for name in ("aten.arange.start_step", "aten.view_copy.default"):
+            self.assertIn(name, op_names)
+        self.assertIn("executorch_call_delegate", op_names)
+        buffer = edge.to_executorch().buffer
+        if _TEST_RUNTIME:
+            y = torch.randint(0, 256, (1, 3, 12, 8), dtype=torch.uint8)
+            program = Runtime.get().load_program(buffer)
+            out = program.load_method("forward").execute((y,))[0]
+            self.assertTrue(torch.allclose(out, model(y), atol=1e-2))
+
+    def test_uint8_input_with_state(self):
+        """
+        A CPU op that reads a uint8 input can read state, or make its new value,
+        while Core ML reads it too.  Such state stays outside of Core ML, which
+        reads it as an input, as does state that only CPU ops read, even when
+        Core ML makes its new value.
+        """
+
+        class Split(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("state", torch.zeros(1, 3, 2, 2))
+
+            def forward(self, image):
+                y = (image + (self.state * 2).to(torch.uint8)).float()
+                self.state.add_(y)
+                return y + 1
+
+        class CopyIn(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("state", torch.zeros(1, 3, 2, 2))
+
+            def forward(self, image):
+                y = self.state * 2 + 1
+                self.state.copy_(image.float())
+                return y
+
+        class ReadOnCpu(CopyIn):
+            def forward(self, image):
+                y = torch.asinh(self.state)
+                self.state.copy_(image.float() + 1)
+                return y
+
+        x = torch.randint(0, 3, (1, 3, 2, 2), dtype=torch.uint8)
+        ios18 = CoreMLBackend.generate_compile_specs(
+            minimum_deployment_target=ct.target.iOS18
+        )
+        # Whether state * 2 runs on the CPU: Core ML takes a partition that
+        # reads only its state from iOS 18, and reads state it does not take
+        # over as an input.
+        lowered = [
+            (Split, CoreMLPartitioner(), True),
+            (Split, CoreMLPartitioner(take_over_mutable_buffer=False), False),
+            (CopyIn, CoreMLPartitioner(compile_specs=ios18), False),
+            (ReadOnCpu, CoreMLPartitioner(), False),
+        ]
+        for model_class, partitioner, mul_on_cpu in lowered:
+            with self.subTest(
+                model=model_class.__name__,
+                state=partitioner.take_over_mutable_buffer,
+            ):
+                ep = torch.export.export(model_class().eval(), (x,), strict=True)
+                edge = executorch.exir.to_edge_transform_and_lower(
+                    ep, partitioner=[partitioner]
+                )
+                op_names = [
+                    n.target.__name__
+                    for n in edge.exported_program().graph.nodes
+                    if n.op == "call_function"
+                ]
+                self.assertEqual("aten.mul.Tensor" in op_names, mul_on_cpu)
+                buffer = edge.to_executorch().buffer
+                if _TEST_RUNTIME:
+                    method = Runtime.get().load_program(buffer).load_method("forward")
+                    eager = model_class().eval()
+                    for _ in range(2):
+                        out = method.execute((x,))[0]
+                        self.assertTrue(torch.allclose(out, eager(x), atol=1e-2))
+
+    def test_uint8_buffer_not_taken_over_is_read_outside_the_delegate(self):
+        """
+        A uint8 buffer that Core ML does not take over is a program input, so
+        the op that reads it runs on the CPU.
+        """
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer(
+                    "lut", torch.randint(0, 256, (8,), dtype=torch.uint8)
+                )
+
+            def forward(self, x):
+                return x * (self.lut.float() / 255.0)
+
+        model = Model().eval()
+        x = torch.randn(2, 8)
+        ep = torch.export.export(model, (x,), strict=True)
+        edge = executorch.exir.to_edge_transform_and_lower(
+            ep, partitioner=[CoreMLPartitioner(take_over_constant_data=False)]
+        )
+        op_names = [
+            n.target.__name__
+            for n in edge.exported_program().graph.nodes
+            if n.op == "call_function"
+        ]
+        self.assertIn("dim_order_ops._to_dim_order_copy.default", op_names)
+        self.assertIn("executorch_call_delegate", op_names)
+        buffer = edge.to_executorch().buffer
+        if _TEST_RUNTIME:
+            program = Runtime.get().load_program(buffer)
+            out = program.load_method("forward").execute((x,))[0]
+            self.assertTrue(torch.allclose(out, model(x), atol=1e-2))
+
+    def test_uint8_made_inside_the_delegate_keeps_ops_whole(self):
+        """
+        A uint8 tensor made inside the delegate is not an input, so the pad
+        that reads it stays in the delegate, whole.
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                image = torch.nn.functional.pad((x * 255).to(torch.uint8), (1, 1))
+                return torch.nn.functional.pad(
+                    image.float() / 255.0, (1, 1), mode="reflect"
+                )
+
+        model = Model().eval()
+        x = torch.rand(1, 3, 8)
+        ep = torch.export.export(model, (x,), strict=True)
+        edge = executorch.exir.to_edge_transform_and_lower(
+            ep, partitioner=[CoreMLPartitioner()]
+        )
+        op_names = {
+            n.target.__name__
+            for n in edge.exported_program().graph.nodes
+            if n.op == "call_function"
+        }
+        self.assertEqual(op_names, {"executorch_call_delegate", "getitem"})
+        buffer = edge.to_executorch().buffer
+        if _TEST_RUNTIME:
+            program = Runtime.get().load_program(buffer)
+            out = program.load_method("forward").execute((x,))[0]
+            self.assertTrue(torch.allclose(out, model(x), atol=1e-2))
+
+    def test_ops_after_a_cpu_op_on_a_tensor_made_inside(self):
+        """
+        A uint8 tensor made in Core ML and passed through an op that stays on
+        the CPU, such as a skipped view or cast, or an add that reads it from
+        another partition past acosh, sends the pad after it to the CPU too.
+        The pad is decomposed there, since the portable kernels have no pad,
+        and so is a pad that makes an int8 model output.
+        """
+
+        class FlipPad(torch.nn.Module):
+            def forward(self, x):
+                d = (x * 255).to(torch.uint8).flip(-1)
+                return torch.nn.functional.pad(d, (1, 1)).float() / 255.0
+
+        class ViewPad(torch.nn.Module):
+            def forward(self, x):
+                d = (x * 255).to(torch.uint8).view(1, 3, 8)
+                return torch.nn.functional.pad(d, (1, 1)).float() / 255.0
+
+        class AcoshPad(torch.nn.Module):
+            def forward(self, x):
+                d = (x * 255).to(torch.uint8)
+                d = d + torch.acosh(d.float() + 2).to(torch.uint8)
+                return torch.nn.functional.pad(d, (1, 1)).float() / 255.0
+
+        class PadInt8(torch.nn.Module):
+            def forward(self, x):
+                return torch.nn.functional.pad((x * 2).to(torch.int8), (1, 1))
+
+        for model, x, skip in (
+            (ViewPad(), torch.rand(1, 3, 2, 4), ["aten.view_copy.default"]),
+            (
+                FlipPad(),
+                torch.rand(1, 3, 8),
+                ["dim_order_ops._to_dim_order_copy.default"],
+            ),
+            (AcoshPad(), torch.rand(1, 3, 8), None),
+            (PadInt8(), torch.randint(-25, 25, (1, 3, 8)).float(), None),
+        ):
+            with self.subTest(model=type(model).__name__, skip=skip):
+                ep = torch.export.export(model.eval(), (x,), strict=True)
+                edge = executorch.exir.to_edge_transform_and_lower(
+                    ep,
+                    partitioner=[
+                        CoreMLPartitioner(skip_ops_for_coreml_delegation=skip)
+                    ],
+                )
+                op_names = [
+                    n.target.__name__
+                    for n in edge.exported_program().graph.nodes
+                    if n.op == "call_function"
+                ]
+                self.assertIn("aten.constant_pad_nd.default", op_names)
+                self.assertIn("executorch_call_delegate", op_names)
+                buffer = edge.to_executorch().buffer
+                if _TEST_RUNTIME:
+                    program = Runtime.get().load_program(buffer)
+                    out = program.load_method("forward").execute((x,))[0]
+                    self.assertTrue(
+                        torch.allclose(out.float(), model(x).float(), atol=1e-2)
+                    )
 
     def test_tied_embedding_is_quantized_with_its_linear(self):
         """A weight that is both an embedding table and an output projection lowers.
