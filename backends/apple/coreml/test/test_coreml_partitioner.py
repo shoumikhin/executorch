@@ -899,6 +899,79 @@ class TestCoreMLPartitioner(unittest.TestCase):
             out = program.load_method("forward").execute((y,))[0]
             self.assertTrue(torch.allclose(out, model(y), atol=1e-2))
 
+    def test_symbolic_value_read_outside_the_delegate(self):
+        """
+        The Core ML delegate returns only tensors, so the item of a flag, a
+        symbolic value that sym_ite reads on the CPU, runs on the CPU too,
+        below and from iOS 18, where a partition with no inputs at all may
+        stay in Core ML.  So does a size the model returns, and with
+        lower_full_graph=True lowering fails and names it.  The other ops are
+        still delegated.
+        """
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("flag", torch.tensor(True))
+
+            def forward(self, x):
+                k = torch.sym_ite(self.flag.item(), 2, 3)
+                return (torch.relu(x) + 1) * k
+
+        model = Model().eval()
+        x = torch.rand(2, 3)
+        for target in (ct.target.iOS15, ct.target.iOS18):
+            with self.subTest(target=target):
+                ep = torch.export.export(model, (x,), strict=False)
+                compile_specs = CoreMLBackend.generate_compile_specs(
+                    minimum_deployment_target=target
+                )
+                edge = self._lower_with_one_search(
+                    ep, CoreMLPartitioner(compile_specs=compile_specs)
+                )
+                op_names = [
+                    n.target.__name__
+                    for n in edge.exported_program().graph.nodes
+                    if n.op == "call_function"
+                ]
+                self.assertIn("_local_scalar_dense.default", op_names)
+                self.assertIn("executorch_call_delegate", op_names)
+                buffer = edge.to_executorch().buffer
+                if _TEST_RUNTIME:
+                    program = Runtime.get().load_program(buffer)
+                    out = program.load_method("forward").execute((x,))[0]
+                    self.assertTrue(torch.allclose(out, model(x), atol=1e-2))
+
+        class ReturnsSize(torch.nn.Module):
+            def forward(self, x):
+                return torch.relu(x) + 1, x.shape[0]
+
+        ep = torch.export.export(
+            ReturnsSize().eval(),
+            (x,),
+            dynamic_shapes=({0: torch.export.Dim("rows", min=2, max=8)},),
+            strict=True,
+        )
+        edge = self._lower_with_one_search(ep, CoreMLPartitioner())
+        op_names = [
+            n.target.__name__
+            for n in edge.exported_program().graph.nodes
+            if n.op == "call_function"
+        ]
+        self.assertIn("sym_size.int", op_names)
+        self.assertIn("executorch_call_delegate", op_names)
+        buffer = edge.to_executorch().buffer
+        if _TEST_RUNTIME:
+            y = torch.rand(5, 3)
+            program = Runtime.get().load_program(buffer)
+            out, rows = program.load_method("forward").execute((y,))
+            self.assertTrue(torch.allclose(out, torch.relu(y) + 1, atol=1e-2))
+            self.assertEqual(rows, 5)
+        with self.assertRaisesRegex(NotImplementedError, "symbolic value.*sym_size"):
+            executorch.exir.to_edge_transform_and_lower(
+                ep, partitioner=[CoreMLPartitioner(lower_full_graph=True)]
+            )
+
     def test_uint8_input_with_state(self):
         """
         A CPU op that reads a uint8 input can read state, or make its new value,

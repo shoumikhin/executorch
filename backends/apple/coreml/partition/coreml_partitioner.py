@@ -179,6 +179,14 @@ def _makes_tensor(
     )
 
 
+def _makes_symbolic_value(node: torch.fx.Node) -> bool:
+    """Whether node makes a symbolic value, such as a size known only at run
+    time."""
+    return isinstance(
+        node.meta.get("val"), (torch.SymInt, torch.SymFloat, torch.SymBool)
+    )
+
+
 # https://github.com/pytorch/executorch/issues/11686
 def _cannot_be_coreml_input(node: torch.fx.Node) -> bool:
     """Whether node makes a uint8 or int8 tensor, which Core ML cannot take as a
@@ -205,12 +213,7 @@ def _cannot_be_read_from_outside(
     """
     return arg.name not in kept_inside and (
         _cannot_be_coreml_input(arg)
-        or (
-            isinstance(
-                arg.meta.get("val"), (torch.SymInt, torch.SymFloat, torch.SymBool)
-            )
-            and outside_coreml(arg)
-        )
+        or (_makes_symbolic_value(arg) and outside_coreml(arg))
     )
 
 
@@ -235,20 +238,31 @@ def _find_readers_of_unsupported_inputs(
     }
 
 
-def _find_makers_of_int8_outputs(partitions: List[Partition]) -> Set[torch.fx.Node]:
-    """The nodes that make an int8 tensor read outside their partition.
+def _cannot_be_coreml_output(node: torch.fx.Node) -> bool:
+    """Whether node makes a value the Core ML delegate cannot return yet.
 
-    Such a tensor becomes a Core ML output, which the Core ML delegate cannot
-    return yet: below iOS 26 coremltools makes it int32, without the int8
+    Below iOS 26 coremltools makes an int8 output int32, without the int8
     wraparound, and from iOS 26 it makes an int8 Core ML array the delegate
-    does not read. An op with several outputs hands each one out through a
-    getitem, which always stays with the op, so the op itself is returned.
+    does not read. The delegate returns only tensors, so a symbolic value
+    cannot be an output either.
+    """
+    return _makes_tensor(node, (torch.int8,)) or _makes_symbolic_value(node)
+
+
+def _find_makers_of_unsupported_outputs(
+    partitions: List[Partition],
+) -> Set[torch.fx.Node]:
+    """The nodes that make a value the Core ML delegate cannot return, for use
+    outside their partition.
+
+    An op with several outputs hands each one out through a getitem, which
+    always stays with the op, so the op itself is returned.
     """
     return {
         node.args[0] if node.target is operator.getitem else node
         for partition in partitions
         for node in partition.nodes
-        if _makes_tensor(node, (torch.int8,))
+        if _cannot_be_coreml_output(node)
         and any(user not in partition.nodes for user in node.users)
     }
 
@@ -286,7 +300,7 @@ def _find_ops_left_out_of_any_partition(
     """The ops _propose_partitions leaves out however it partitions the rest:
     each op that reads a tensor Core ML cannot take as an input, or a symbolic
     value, from an op outside of Core ML, and each op that makes an int8 tensor
-    an op outside of Core ML uses.
+    or a symbolic value an op outside of Core ML uses.
     """
     left_out: Set[torch.fx.Node] = set()
 
@@ -307,7 +321,7 @@ def _find_ops_left_out_of_any_partition(
             ):
                 left_out.add(node)
                 changed = True
-            elif _makes_tensor(node, (torch.int8,)) and any(
+            elif _cannot_be_coreml_output(node) and any(
                 outside(user) for user in node.users
             ):
                 maker = node.args[0] if node.target is operator.getitem else node
@@ -323,11 +337,11 @@ def _find_ops_partitioning_may_leave_out(
 ) -> Set[torch.fx.Node]:
     """The ops _propose_partitions may leave out of Core ML.
 
-    Those that read a uint8 or int8 tensor, make an int8 tensor, or read a
-    symbolic value computed outside of Core ML set it off. Once it leaves out
-    one, a partition left without tensor inputs moves out too, and such a
-    partition holds only ops that compute from the weights, constants and
-    state the partitioner moves into Core ML.
+    Those that read a uint8 or int8 tensor, make a value the delegate cannot
+    return, or read a symbolic value from an op that may be outside of Core ML
+    set it off. Once it leaves out one, a partition left without tensor inputs
+    moves out too, and such a partition holds only ops that compute from the
+    weights, constants and state the partitioner moves into Core ML.
     """
     set_off: Set[torch.fx.Node] = set()
     from_kept_inside: Set[torch.fx.Node] = set()
@@ -342,7 +356,7 @@ def _find_ops_partitioning_may_leave_out(
             if _makes_tensor(arg)
         ):
             from_kept_inside.add(node)
-        if _makes_tensor(node, (torch.int8,)) or any(
+        if _cannot_be_coreml_output(node) or any(
             _cannot_be_read_from_outside(
                 arg, kept_inside, lambda arg: arg in set_off or not is_supported(arg)
             )
@@ -358,10 +372,10 @@ def _propose_partitions(
     kept_inside: Collection[str],
     allow_partitions_without_inputs: bool,
 ) -> Tuple[List[Partition], Set[torch.fx.Node]]:
-    """Propose Core ML partitions, leaving out every op that reads a tensor
-    Core ML cannot take as an input from outside its partition or makes an
-    int8 one for use outside, and then every partition this leaves without a
-    tensor input.
+    """Propose Core ML partitions, leaving out every op that reads a value
+    Core ML cannot take as an input from outside its partition or makes one
+    the delegate cannot return for use outside, and then every partition this
+    leaves without a tensor input.
 
     Returns the partitions and the ops left out.
     """
@@ -380,7 +394,7 @@ def _propose_partitions(
         ).propose_partitions()
         new = _find_readers_of_unsupported_inputs(
             partitions, kept_inside
-        ) | _find_makers_of_int8_outputs(partitions)
+        ) | _find_makers_of_unsupported_outputs(partitions)
         if new or left_out:
             # Moving those ops out can leave a partition that reads no tensor,
             # such as the index math of a gather.
@@ -804,6 +818,15 @@ class CoreMLPartitioner(Partitioner):
                 if _makes_tensor(node, (torch.int8,))
                 and any(user not in left_out for user in node.users)
             )
+            inside = {node for partition in partition_list for node in partition.nodes}
+            symbols = sorted(
+                node.name
+                for node in left_out
+                if any(
+                    _makes_symbolic_value(other) and other not in inside
+                    for other in (node, *node.all_input_nodes)
+                )
+            )
             reasons = []
             if inputs:
                 reasons.append(
@@ -815,16 +838,21 @@ class CoreMLPartitioner(Partitioner):
                     "makes an int8 tensor, which the CoreML delegate cannot "
                     "return, for use outside of CoreML: " + ", ".join(outputs)
                 )
+            if symbols:
+                reasons.append(
+                    "makes or reads a symbolic value, which CoreML can neither "
+                    "take as an input nor return, outside of CoreML: "
+                    + ", ".join(symbols)
+                )
             msg = (
                 f"The model {', and '.join(reasons)}."
                 if reasons
-                else "The model uses a uint8 or int8 tensor CoreML cannot handle."
+                else "The model uses a tensor or a symbolic value CoreML cannot handle."
             )
             if self.lower_full_graph:
                 raise NotImplementedError(
-                    f"{msg}  Use a dtype CoreML supports for these tensors, or set "
-                    "lower_full_graph=False in the CoreMLPartitioner to run the ops "
-                    "that use them outside of CoreML."
+                    f"{msg}  Set lower_full_graph=False in the CoreMLPartitioner "
+                    "to run these ops outside of CoreML."
                 )
             self.log_once(
                 f"{msg}  Running these ops outside of CoreML: "
