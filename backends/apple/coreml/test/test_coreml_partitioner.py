@@ -17,6 +17,9 @@ import torchvision
 
 from executorch.backends.apple.coreml.compiler import CoreMLBackend
 from executorch.backends.apple.coreml.partition import CoreMLPartitioner
+from executorch.backends.apple.coreml.test.test_coreml_utils import (
+    IS_VALID_TEST_RUNTIME,
+)
 from executorch.exir.backend.utils import format_delegated_graph
 
 
@@ -520,6 +523,170 @@ class TestCoreMLPartitioner(unittest.TestCase):
             program = Runtime.get().load_program(edge.to_executorch().buffer)
             out = program.load_method("forward").execute((x,))[0]
             self.assertTrue(torch.allclose(out, model(x), atol=5e-2, rtol=5e-2))
+
+    def test_min_max_of_bool_is_skipped(self):
+        """
+        coremltools raises on a min or max of bool tensors, such as the
+        all-true check torch.distributions exports.  The partitioner must leave
+        those ops to the portable backend and still delegate the rest,
+        including a min or max with a float input.
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                ok = (x.tril() == x).view(1, -1)
+                flags = ok.min(-1)[0].to(x.dtype) + ok.amax(-1).to(x.dtype)
+                both = torch.maximum(ok, ok.flip(-1)).view(x.shape).to(x.dtype)
+                floats = x.amax(-1, keepdim=True) + torch.maximum(x > 0.5, x)
+                return x * 2 + flags + both + floats
+
+        model = Model().eval()
+        x = torch.rand(14, 14)
+        ep = torch.export.export(model, (x,), strict=True)
+        edge = executorch.exir.to_edge_transform_and_lower(
+            ep, partitioner=[CoreMLPartitioner()]
+        )
+        op_names = [
+            n.target.__name__
+            for n in edge.exported_program().graph.nodes
+            if n.op == "call_function"
+        ]
+        self.assertIn("executorch_call_delegate", op_names)
+        self.assertIn("aten.min.dim", op_names)
+        self.assertEqual(op_names.count("aten.amax.default"), 1)
+        self.assertEqual(op_names.count("aten.maximum.default"), 1)
+        if _TEST_RUNTIME:
+            program = Runtime.get().load_program(edge.to_executorch().buffer)
+            out = program.load_method("forward").execute((x,))[0]
+            self.assertTrue(torch.allclose(out, model(x), atol=1e-2))
+
+    def test_index_put_forms_coremltools_gets_wrong(self):
+        """
+        coremltools fails some forms of ``index_put``, such as
+        ``y[:, idx] = v`` with two entries in ``idx``, or writes them to the
+        wrong place, so the partitioner refuses those, and they run on the
+        portable backend.  With lower_full_graph=True, lowering fails and says
+        why.
+        """
+
+        class Scatter(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("cols", torch.tensor([0, 2]))
+                self.register_buffer("col", torch.tensor([1]))
+                self.register_buffer("last", torch.tensor(3))
+                self.register_buffer("rows", torch.tensor([[1], [2]]))
+                self.register_buffer("flag", torch.tensor([2]))
+                self.register_buffer("rows_mask", torch.tensor([True, True, True]))
+                self.register_buffer("trio", torch.tensor([0, 2, 3]))
+                self.register_buffer("grid", torch.tensor([[1]]))
+                self.register_buffer("yes", torch.tensor([True]))
+
+            def forward(self, x, a, b, c):
+                y = x * 2
+                y[:, self.cols] = a
+                y[:, self.grid] = a[:, :, None]
+                y[self.rows, self.cols] = b
+                y[self.rows_mask, self.trio] = c
+                torch.ops.aten.index_put_(y, [None, self.col], a, True)
+                torch.ops.aten.index_put_(y, [None, self.last], c)
+                mask = y > 0.5
+                mask[:, self.flag] = a > 0.5
+                z = a * 2
+                z[:, self.yes] = c[:, None]
+                return y + mask + z
+
+        class Scatter3d(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("last", torch.tensor(2))
+                self.register_buffer("mid", torch.tensor(1))
+
+            def forward(self, x, v):
+                y = x.clone()
+                torch.ops.aten.index_put_(y, [None, None, self.last], v)
+                # Values that vary only after the index stay in Core ML.
+                torch.ops.aten.index_put_(y, [None, self.mid], v[0] * torch.arange(3.0))
+                return y * 2
+
+        ios18 = CoreMLBackend.generate_compile_specs(
+            minimum_deployment_target=ct.target.iOS18
+        )
+        scatter_inputs = (
+            torch.rand(3, 4),
+            torch.rand(3, 1),
+            torch.rand(2, 2),
+            torch.rand(3),
+        )
+        scatter3d_inputs = (torch.rand(2, 2, 3), torch.rand(2, 1))
+        cases = [
+            (Scatter(), scatter_inputs, 8, None),
+            # From iOS 18 the bool write stays in Core ML.
+            (Scatter(), scatter_inputs, 7, ios18),
+            (Scatter3d(), scatter3d_inputs, 1, None),
+        ]
+        for model, inputs, cpu_calls, compile_specs in cases:
+            with self.subTest(
+                model=type(model).__name__, ios18=compile_specs is not None
+            ):
+                ep = torch.export.export(model.eval(), inputs, strict=True)
+                edge = executorch.exir.to_edge_transform_and_lower(
+                    ep, partitioner=[CoreMLPartitioner(compile_specs=compile_specs)]
+                )
+                op_names = [
+                    n.target.__name__
+                    for n in edge.exported_program().graph.nodes
+                    if n.op == "call_function"
+                ]
+                self.assertIn("executorch_call_delegate", op_names)
+                self.assertEqual(op_names.count("aten.index_put.default"), cpu_calls)
+                # An iOS 18 program needs macOS 15 to run.
+                if IS_VALID_TEST_RUNTIME:
+                    program = Runtime.get().load_program(edge.to_executorch().buffer)
+                    out = program.load_method("forward").execute(inputs)[0]
+                    self.assertTrue(torch.allclose(out, model(*inputs), atol=1e-2))
+
+        class BoolWrite(torch.nn.Module):
+            def __init__(self, index):
+                super().__init__()
+                self.register_buffer("index", index)
+
+            def forward(self, x, a):
+                return torch.ops.aten.index_put(x > 0.5, [None, self.index], a > 0.5)
+
+        for model, inputs, reason in (
+            (Scatter3d(), scatter3d_inputs, "values that vary before the last index"),
+            (
+                BoolWrite(torch.tensor([2])),
+                scatter_inputs[:2],
+                "minimum_deployment_target below iOS 18",
+            ),
+            # A bool write that a later target would not fix gives its own reason.
+            (BoolWrite(torch.tensor([0, 2])), scatter_inputs[:2], "other than an int"),
+        ):
+            with self.assertRaisesRegex(NotImplementedError, reason):
+                executorch.exir.to_edge_transform_and_lower(
+                    torch.export.export(model, inputs, strict=True),
+                    partitioner=[CoreMLPartitioner(lower_full_graph=True)],
+                )
+        # With a batch size known only at run time, the write that stays in
+        # Core ML above goes to the CPU too.
+        batch = torch.export.Dim("batch", min=2, max=8)
+        ep = torch.export.export(
+            Scatter3d(),
+            scatter3d_inputs,
+            dynamic_shapes=({0: batch}, {0: batch}),
+            strict=True,
+        )
+        edge = executorch.exir.to_edge_transform_and_lower(
+            ep, partitioner=[CoreMLPartitioner()]
+        )
+        op_names = [
+            n.target.__name__
+            for n in edge.exported_program().graph.nodes
+            if n.op == "call_function"
+        ]
+        self.assertEqual(op_names.count("aten.index_put.default"), 2)
 
     def test_tied_embedding_is_quantized_with_its_linear(self):
         """A weight that is both an embedding table and an output projection lowers.
