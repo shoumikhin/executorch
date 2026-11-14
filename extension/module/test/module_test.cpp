@@ -886,6 +886,28 @@ TEST_F(ModuleTest, TestSharedStateBufferIsMarkedShared) {
   }
 }
 
+TEST_F(ModuleTest, TestSharedStateWithoutSharedArenas) {
+#ifdef USE_ATEN_LIB
+  GTEST_SKIP()
+      << "dim_order_ops::_to_dim_order_copy.out not available in ATen mode";
+#endif
+  // The program marks its state shared, so the methods share it without
+  // share_memory_arenas.
+  Module module(shared_state_path_);
+
+  ASSERT_EQ(
+      module.execute("set_state", make_tensor_ptr({1}, {5.f})).error(),
+      Error::Ok);
+  auto forward = module.forward(make_tensor_ptr({1}, {2.f}));
+  ASSERT_EQ(forward.error(), Error::Ok);
+  EXPECT_TENSOR_CLOSE(
+      forward.get()[0].toTensor(), *make_tensor_ptr({1}, {8.f}).get());
+  auto state = module.execute("get_state");
+  ASSERT_EQ(state.error(), Error::Ok);
+  EXPECT_TENSOR_CLOSE(
+      state.get()[0].toTensor(), *make_tensor_ptr({1}, {6.f}).get());
+}
+
 TEST_F(ModuleTest, TestSharedMemoryBuffer) {
 #ifdef USE_ATEN_LIB
   GTEST_SKIP()

@@ -135,11 +135,10 @@ TEST_F(ModuleDeviceMemoryTest, DeviceModelMethodMetaReportsCudaBuffer) {
   }
 }
 
-TEST_F(ModuleDeviceMemoryTest, DeviceModelWithSharedArenasReturnsNotSupported) {
+TEST_F(ModuleDeviceMemoryTest, SharedArenasLeaveUnmarkedDeviceBuffersPrivate) {
   const char* path = std::getenv("ET_MODULE_ADD_WITH_DEVICE_PATH");
   ASSERT_NE(path, nullptr) << "ET_MODULE_ADD_WITH_DEVICE_PATH not set";
 
-  // share_memory_arenas = true with a device-annotated model should fail.
   Module module(
       path,
       Module::LoadMode::File,
@@ -148,8 +147,12 @@ TEST_F(ModuleDeviceMemoryTest, DeviceModelWithSharedArenasReturnsNotSupported) {
       /*temp_allocator=*/nullptr,
       /*share_memory_arenas=*/true);
 
-  auto err = module.load_method("forward");
-  EXPECT_EQ(err, Error::NotSupported);
+  // The program does not mark its device buffer shared, so the method gets its
+  // own, as without share_memory_arenas. Planned memory is allocated before
+  // the backend initializes, so this holds even where that backend is absent.
+  (void)module.load_method("forward");
+  EXPECT_EQ(g_mock_cuda.allocate_count_, 1);
+  EXPECT_EQ(g_mock_cuda.last_allocate_size_, 48);
 }
 
 TEST_F(ModuleDeviceMemoryTest, DeviceAllocationFailureIsReportedNotFatal) {

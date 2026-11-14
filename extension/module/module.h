@@ -80,12 +80,17 @@ class Module {
    * @param[in] load_mode The loading mode to use.
    * @param[in] event_tracer A EventTracer used for tracking and logging events.
    * @param[in] share_memory_arenas When true, all methods loaded by this Module
-   * share the same memory-planned buffers for mem_id=1 (activation memory)
-   * and mem_id=2 (shared mutable buffer memory), sized to the max
-   * across all methods. mem_id>2 indicates a custom memory plan, and those
-   * receive fresh memory buffers. share_memory_arenas is required for models
-   * exported with share_mutable_buffers=true, where methods access shared
-   * mutable state (e.g., set/get state). When enabled, outputs from one method
+   * share the same host memory-planned buffers for mem_id=1 (activation
+   * memory) and mem_id=2, sized to the max across all methods. mem_id>2
+   * indicates a custom memory plan, and those receive fresh memory buffers, as
+   * do buffers in device memory. A buffer the program marks as shared, such as
+   * the mutable state of a model exported with share_mutable_buffers=true, is
+   * shared by every method that marks it whatever this flag says, in host or
+   * device memory. Loading a method copies the initial data of such a buffer,
+   * if the program stores any, into it again, so load every method before
+   * executing one. Older programs do not mark it, so they need this flag for
+   * methods to access shared mutable state (e.g., set/get state). When
+   * enabled, outputs from one method
    * may be invalidated by executing another method, since their output tensors
    * can alias the same underlying buffer. Consume or copy outputs before
    * calling execute again. NOTE: This class is not thread-safe and performs
@@ -737,13 +742,17 @@ class Module {
     std::vector<runtime::etensor::Device> planned_devices;
     std::unique_ptr<runtime::HierarchicalAllocator> planned_memory;
   };
-  std::unique_ptr<PlannedMemory> make_planned_memory(
-      const std::vector<size_t>& buffer_sizes);
-  std::unique_ptr<PlannedMemory> make_planned_memory_with_shared_arenas(
-      const std::vector<size_t>& buffer_sizes,
-      std::vector<std::vector<uint8_t>>& shared_arenas);
-  runtime::Result<std::unique_ptr<PlannedMemory>>
-  make_planned_memory_with_devices(
+  /// Backs a buffer that every method marking it shared reads and writes.
+  struct SharedBuffer {
+    runtime::etensor::Device device;
+    std::vector<uint8_t> host_buffer;
+    runtime::DeviceMemoryBuffer device_buffer;
+    runtime::Span<uint8_t> span;
+  };
+  runtime::Result<runtime::Span<uint8_t>> get_shared_buffer(
+      size_t index,
+      runtime::etensor::Device device);
+  runtime::Result<std::unique_ptr<PlannedMemory>> make_planned_memory(
       const ET_RUNTIME_NAMESPACE::MethodMeta& method_meta);
   runtime::Result<std::vector<size_t>> get_mem_planned_buffer_sizes(
       const std::string& method_name);
@@ -769,6 +778,7 @@ class Module {
   std::vector<std::unique_ptr<NamedDataMap>> named_data_maps_;
   std::unique_ptr<NamedDataMap> merged_data_map_;
   std::vector<std::vector<uint8_t>> shared_arenas_;
+  std::unordered_map<size_t, SharedBuffer> shared_buffers_;
   ET_DEPRECATED std::vector<uint8_t> debug_buffer_;
   // Module-owned deep-copy of the backend options most recently installed
   // via load(LoadBackendOptionsMap, ...). `backend_options_storage_` owns
