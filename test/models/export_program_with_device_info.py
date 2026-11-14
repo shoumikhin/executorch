@@ -13,6 +13,9 @@ so that delegate output tensors are annotated with CUDA device in the .pte.
 ModuleAddConstantWithDevice is exported with skip_h2d_for_constants and
 target_device=cuda:1, so its constant is planned in cuda:1 memory with its data
 as the initial state, once in the program and once in a separate .ptd file.
+ModuleSharedStateWithDevice has three methods that share one mutable buffer,
+planned in cuda:0 memory. Its ops run on the host, so it only runs with a test
+allocator that hands out host memory.
 """
 
 import argparse
@@ -20,7 +23,11 @@ import os
 
 import torch
 from executorch.exir import EdgeCompileConfig, ExecutorchBackendConfig, to_edge
-from executorch.exir.backend.test.device_util import DeviceAwarePartitioner
+from executorch.exir.backend.test.device_util import (
+    BuffersOnDevicePlanningPass,
+    DeviceAwarePartitioner,
+)
+from executorch.exir.capture._capture import patch_forward
 from executorch.exir.passes import MemoryPlanningPass
 from executorch.exir.passes.propagate_device_config import PropagateDeviceConfig
 from torch import nn
@@ -80,6 +87,47 @@ def export_constant_on_device(outdir: str, external_constants: bool) -> None:
         et_prog.write_tensor_data_to_file(outdir)
 
 
+class ModuleSharedStateWithDevice(nn.Module):
+    """Methods that read and write one state, as prefill and decode share a KV cache."""
+
+    state: torch.Tensor
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("state", torch.zeros(2, 2))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.state.add_(x) * 2
+
+    def get_state(self) -> torch.Tensor:
+        return self.state
+
+    def set_state(self, x: torch.Tensor) -> None:
+        self.state.copy_(x)
+
+
+def export_shared_state_on_device(outdir: str) -> None:
+    model = ModuleSharedStateWithDevice()
+    methods = {"forward": export(model, (torch.ones(2, 2),))}
+    with patch_forward(model, model.get_state):
+        methods["get_state"] = export(model, ())
+    with patch_forward(model, model.set_state):
+        methods["set_state"] = export(model, (torch.zeros(2, 2),))
+    et_prog = to_edge(
+        methods, compile_config=EdgeCompileConfig(_check_ir_validity=False)
+    ).to_executorch(
+        ExecutorchBackendConfig(  # type: ignore[call-arg]
+            emit_stacktrace=False,
+            enable_non_cpu_memory_planning=True,
+            memory_planning_pass=BuffersOnDevicePlanningPass(
+                {"state"}, share_mutable_buffers=True
+            ),
+        )
+    )
+    with open(os.path.join(outdir, "ModuleSharedStateWithDevice.pte"), "wb") as fp:
+        fp.write(et_prog.buffer)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir", type=str, required=True)
@@ -110,6 +158,7 @@ def main() -> None:
 
     for external_constants in (False, True):
         export_constant_on_device(args.outdir, external_constants)
+    export_shared_state_on_device(args.outdir)
 
 
 if __name__ == "__main__":

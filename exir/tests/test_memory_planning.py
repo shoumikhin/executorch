@@ -25,7 +25,17 @@ except ModuleNotFoundError:
     del logging
 
 import torch
-from executorch.exir import EdgeCompileConfig, ExecutorchBackendConfig, to_edge
+from executorch.exir import (
+    EdgeCompileConfig,
+    ExecutorchBackendConfig,
+    schema,
+    to_edge,
+)
+from executorch.exir.backend.partitioner import Partitioner
+from executorch.exir.backend.test.device_util import (
+    BuffersOnDevicePlanningPass,
+    DeviceAwarePartitioner,
+)
 from executorch.exir.capture._capture import patch_forward
 from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.error import InternalError
@@ -52,7 +62,13 @@ from executorch.exir.passes import (  # noqa
 )
 from executorch.exir.passes.reinplace import DEFAULT_INPLACEABLE_OPS, reinplace_pass
 from executorch.exir.passes.sym_shape_eval_pass import ConstraintBasedSymShapeEvalPass
-from executorch.exir.schema import DeviceType, Program
+from executorch.exir.schema import (
+    AllocationDetails,
+    DeviceType,
+    ExecutionPlan,
+    NonConstBufferDevice,
+    Program,
+)
 from executorch.exir.tensor import TensorSpec
 from functorch.experimental.control_flow import map as torch_map
 from parameterized import parameterized
@@ -1469,6 +1485,7 @@ class TestMap(unittest.TestCase):
     def _export_stateful_methods(
         self,
         memory_planning_pass: Union[MemoryPlanningPass, Dict[str, MemoryPlanningPass]],
+        partitioner: Optional[Partitioner] = None,
     ) -> Program:
         eager_module = MultiEntryPointStatefulModel().eval()
         forward = export(eager_module, eager_module.get_example_inputs())
@@ -1480,6 +1497,8 @@ class TestMap(unittest.TestCase):
             {"forward": forward, "set_state": set_state, "get_state": get_state},
             compile_config=EdgeCompileConfig(_check_ir_validity=False),
         )
+        if partitioner is not None:
+            edge = edge.to_backend({"forward": partitioner})
         return edge.to_executorch(
             ExecutorchBackendConfig(
                 memory_planning_pass=memory_planning_pass,
@@ -1487,6 +1506,84 @@ class TestMap(unittest.TestCase):
                 enable_non_cpu_memory_planning=True,
             )
         ).executorch_program
+
+    def _state_allocation(self, plan: ExecutionPlan) -> AllocationDetails:
+        (state,) = [
+            value.val
+            for value in plan.values
+            if isinstance(value.val, schema.Tensor)
+            and value.val.extra_tensor_info is not None
+            and value.val.extra_tensor_info.fully_qualified_name == "state"
+        ]
+        assert state.allocation_info is not None
+        return state.allocation_info
+
+    def test_shared_mutable_buffer_on_device(self) -> None:
+        program = self._export_stateful_methods(
+            BuffersOnDevicePlanningPass(
+                {"state"}, device_index=1, share_mutable_buffers=True
+            )
+        )
+        self.assertEqual(len(program.execution_plan), 3)
+        for plan in program.execution_plan:
+            self.assertEqual(plan.shared_non_const_buffers, [2])
+            # 2 x 2 float32 values.
+            self.assertEqual(plan.non_const_buffer_sizes[2], 16)
+            self.assertEqual(
+                plan.non_const_buffer_device,
+                [
+                    NonConstBufferDevice(
+                        buffer_idx=2, device_type=DeviceType.CUDA, device_index=1
+                    )
+                ],
+            )
+            state = self._state_allocation(plan)
+            self.assertEqual(state.memory_id, 2)
+            self.assertEqual(state.memory_offset_low, 0)
+
+    def test_shared_mutable_buffer_on_device_moves_device_arenas(self) -> None:
+        # The delegated add plans its output in a cuda:0 arena of forward's own.
+        # The shared arena takes mem_id 2 in every method, so that one moves up.
+        program = self._export_stateful_methods(
+            BuffersOnDevicePlanningPass({"state"}, share_mutable_buffers=True),
+            DeviceAwarePartitioner("cuda:0"),
+        )
+        plans = {plan.name: plan for plan in program.execution_plan}
+        for plan in plans.values():
+            self.assertEqual(plan.shared_non_const_buffers, [2])
+            self.assertEqual(plan.non_const_buffer_sizes[2], 16)
+            self.assertEqual(self._state_allocation(plan).memory_id, 2)
+
+        forward = plans["forward"]
+        self.assertEqual(len(forward.non_const_buffer_sizes), 4)
+        self.assertEqual(
+            forward.non_const_buffer_device,
+            [
+                NonConstBufferDevice(
+                    buffer_idx=2, device_type=DeviceType.CUDA, device_index=0
+                ),
+                NonConstBufferDevice(
+                    buffer_idx=3, device_type=DeviceType.CUDA, device_index=0
+                ),
+            ],
+        )
+        memory_ids = {
+            value.val.allocation_info.memory_id
+            for value in forward.values
+            if isinstance(value.val, schema.Tensor)
+            and value.val.allocation_info is not None
+        }
+        self.assertIn(3, memory_ids)
+        self.assertEqual(len(plans["get_state"].non_const_buffer_sizes), 3)
+
+    def test_sharing_pass_plans_two_programs(self) -> None:
+        planning_pass = MemoryPlanningPass(share_mutable_buffers=True)
+        first = self._export_stateful_methods(planning_pass)
+        second = self._export_stateful_methods(planning_pass)
+        for program in (first, second):
+            for plan in program.execution_plan:
+                self.assertEqual(len(plan.non_const_buffer_sizes), 3)
+                self.assertEqual(self._state_allocation(plan).memory_offset_low, 0)
 
     def test_methods_sharing_buffers_need_one_planning_pass(self) -> None:
         shared = MemoryPlanningPass(share_mutable_buffers=True)
@@ -1503,6 +1600,29 @@ class TestMap(unittest.TestCase):
                     "get_state": MemoryPlanningPass(share_mutable_buffers=True),
                     "set_state": shared,
                 }
+            )
+
+    def test_shared_mutable_buffers_on_two_devices_are_refused(self) -> None:
+        class TwoStates(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.register_buffer("state", torch.zeros(2))
+                self.register_buffer("count", torch.zeros(1))
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                self.count.add_(1)
+                return self.state.add_(x) * 2
+
+        model = TwoStates()
+        edge = to_edge({"forward": export(model, (torch.ones(2),))})
+        with self.assertRaisesRegex(ValueError, "more than one device"):
+            edge.to_executorch(
+                ExecutorchBackendConfig(
+                    memory_planning_pass=BuffersOnDevicePlanningPass(
+                        {"state"}, share_mutable_buffers=True
+                    ),
+                    enable_non_cpu_memory_planning=True,
+                )
             )
 
 

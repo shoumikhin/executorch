@@ -10,9 +10,10 @@ Provides ``DeviceAwarePartitioner`` (delegates add ops to a configurable
 target device) and ``CpuOnlyPartitioner`` (delegates add ops without any
 device annotation).  Both use ``AddOperatorSupport`` to select
 ``aten.add.Tensor`` nodes for delegation via ``BackendWithCompilerDemo``.
+``BuffersOnDevicePlanningPass`` plans chosen buffers in device memory.
 """
 
-from typing import Dict, final
+from typing import Dict, final, Optional, Set
 
 import torch
 from executorch.exir.backend.canonical_partitioners.pattern_op_partitioner import (
@@ -28,7 +29,10 @@ from executorch.exir.backend.test.backend_with_compiler_demo import (
     BackendWithCompilerDemo,
 )
 from executorch.exir.dialects._ops import ops as exir_ops
+from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 from executorch.exir.passes.propagate_device_pass import TARGET_DEVICE_COMPILE_SPEC_KEY
+from executorch.exir.schema import DeviceType
+from torch.export.exported_program import ExportGraphSignature
 from torch.fx.passes.operator_support import any_chain, OperatorSupportBase
 
 
@@ -110,3 +114,32 @@ class CpuOnlyPartitioner(Partitioner):
             tagged_exported_program=exported_program,
             partition_tags=partition_tags,
         )
+
+
+class BuffersOnDevicePlanningPass(MemoryPlanningPass):
+    """Plans the buffers named in ``buffer_fqns`` in ``cuda:device_index`` memory.
+
+    Stands in for a backend that updates a buffer in place on the device, which
+    tags the buffer with its device before memory planning.
+    """
+
+    def __init__(self, buffer_fqns: Set[str], device_index: int = 0, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.buffer_fqns = buffer_fqns
+        self.device_index = device_index
+
+    def run(
+        self,
+        graph_module: torch.fx.GraphModule,
+        graph_signature: Optional[ExportGraphSignature] = None,
+    ):
+        assert graph_signature is not None
+        for node in graph_module.graph.nodes:
+            if (
+                node.op == "placeholder"
+                and graph_signature.inputs_to_buffers.get(node.target)
+                in self.buffer_fqns
+            ):
+                node.meta["spec"].device = DeviceType.CUDA
+                node.meta["spec"].device_index = self.device_index
+        return super().run(graph_module, graph_signature)

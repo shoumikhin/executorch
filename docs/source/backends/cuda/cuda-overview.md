@@ -252,9 +252,9 @@ method that reads it on the host, the `.pte` holds it twice. A constant that a h
 second device also reads is still copied on every call. So is a constant that is changed on the
 host before the delegate reads it, such as by a view, a transpose or a clone, and
 `error_on_per_call_copies` does not catch that copy. Have the partitioner take that change into
-the delegate, so that the delegate reads the constant itself. `share_mutable_buffers` needs every
-planned tensor in host memory, so it does not work with this flag. This flag works on its own: it
-needs neither `skip_h2d_for_method_inputs` nor unplanned inputs.
+the delegate, so that the delegate reads the constant itself. `share_mutable_buffers` refuses a
+registered buffer kept on the device this way, so with it only parameters stay on the device. This
+flag works on its own: it needs neither `skip_h2d_for_method_inputs` nor unplanned inputs.
 
 **`skip_h2d_for_method_inputs` refuses changed inputs that a delegate reads.** `to_executorch` fails
 if the method changes an input that a delegate reads, even when the delegate makes the change. This

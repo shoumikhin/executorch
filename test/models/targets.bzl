@@ -229,6 +229,7 @@ def define_common_targets():
             "ModuleAddConstantWithDevice.pte": ["ModuleAddConstantWithDevice.pte"],
             "ModuleAddConstantWithDeviceProgram.pte": ["ModuleAddConstantWithDeviceProgram.pte"],
             "ModuleAddConstantWithDeviceProgram.ptd": ["ModuleAddConstantWithDeviceProgram.ptd"],
+            "ModuleSharedStateWithDevice.pte": ["ModuleSharedStateWithDevice.pte"],
         },
         default_outs = ["."],
         visibility = [

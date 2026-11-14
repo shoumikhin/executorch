@@ -22,11 +22,14 @@
 
 #include <gtest/gtest.h>
 
+#include <executorch/extension/tensor/tensor.h>
 #include <executorch/runtime/core/device_allocator.h>
 #include <executorch/runtime/core/device_memory_buffer.h>
+#include <executorch/runtime/core/exec_aten/testing_util/tensor_util.h>
 #include <executorch/runtime/core/test/mock_cuda_allocator.h>
 #include <executorch/runtime/platform/runtime.h>
 
+using executorch::extension::make_tensor_ptr;
 using executorch::extension::Module;
 using executorch::runtime::DeviceMemoryBuffer;
 using executorch::runtime::Error;
@@ -153,6 +156,43 @@ TEST_F(ModuleDeviceMemoryTest, SharedArenasLeaveUnmarkedDeviceBuffersPrivate) {
   (void)module.load_method("forward");
   EXPECT_EQ(g_mock_cuda.allocate_count_, 1);
   EXPECT_EQ(g_mock_cuda.last_allocate_size_, 48);
+}
+
+TEST_F(ModuleDeviceMemoryTest, MethodsShareOneDeviceAllocationOfSharedState) {
+#ifdef USE_ATEN_LIB
+  GTEST_SKIP() << "the shared state program is built for portable kernels";
+#endif
+  const char* path = std::getenv("ET_MODULE_SHARED_STATE_WITH_DEVICE_PATH");
+  ASSERT_NE(path, nullptr) << "ET_MODULE_SHARED_STATE_WITH_DEVICE_PATH not set";
+
+  {
+    Module module(path);
+    ASSERT_EQ(module.load_method("set_state"), Error::Ok);
+    ASSERT_EQ(module.load_method("forward"), Error::Ok);
+    ASSERT_EQ(module.load_method("get_state"), Error::Ok);
+
+    // One allocation of the 2 x 2 float state serves every method.
+    EXPECT_EQ(g_mock_cuda.allocate_count_, 1);
+    EXPECT_EQ(g_mock_cuda.last_allocate_size_, 16);
+
+    ASSERT_EQ(
+        module
+            .execute("set_state", make_tensor_ptr({2, 2}, {1.f, 2.f, 3.f, 4.f}))
+            .error(),
+        Error::Ok);
+    auto forward =
+        module.forward(make_tensor_ptr({2, 2}, {10.f, 10.f, 10.f, 10.f}));
+    ASSERT_EQ(forward.error(), Error::Ok);
+    EXPECT_TENSOR_EQ(
+        forward.get()[0].toTensor(),
+        *make_tensor_ptr({2, 2}, {22.f, 24.f, 26.f, 28.f}));
+    auto state = module.execute("get_state");
+    ASSERT_EQ(state.error(), Error::Ok);
+    EXPECT_TENSOR_EQ(
+        state.get()[0].toTensor(),
+        *make_tensor_ptr({2, 2}, {11.f, 12.f, 13.f, 14.f}));
+  }
+  EXPECT_EQ(g_mock_cuda.deallocate_count_, 1);
 }
 
 TEST_F(ModuleDeviceMemoryTest, DeviceAllocationFailureIsReportedNotFatal) {

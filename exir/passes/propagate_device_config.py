@@ -108,8 +108,9 @@ class PropagateDeviceConfig:
     # first, such as by a view, a transpose or a clone, is copied on every
     # call, and error_on_per_call_copies does not catch that copy. To keep
     # it, have the partitioner take that change into the delegate too.
-    # MemoryPlanningPass(share_mutable_buffers=True) needs every planned tensor
-    # in host memory, so it does not work with this option.
+    # MemoryPlanningPass(share_mutable_buffers=True) refuses a registered
+    # buffer kept on the device this way, so with it only parameters stay on
+    # the device.
     skip_h2d_for_constants: bool = False
 
     def __hash__(self) -> int:

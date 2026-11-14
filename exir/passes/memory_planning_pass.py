@@ -8,7 +8,7 @@
 import itertools
 import logging
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -28,6 +28,7 @@ from executorch.exir.memory_planning import (
 )
 from executorch.exir.operator.convert import get_out_args_from_opoverload
 from executorch.exir.pass_base import PassBase, PassResult
+from executorch.exir.schema import DeviceType, NonConstBufferDevice
 from executorch.exir.tensor import ALIGNMENT, TensorSpec
 from torch import fx
 from torch.export.exported_program import ExportGraphSignature
@@ -119,7 +120,9 @@ def _insert_mutable_buffer_specs(
             state.maybe_mutable_buffers[fqn].add(spec)
 
 
-def _check_default_mem_ids(gm: torch.fx.GraphModule):
+def _planned_specs(gm: torch.fx.GraphModule) -> List[TensorSpec]:
+    """Every distinct TensorSpec read or written by a node of gm."""
+    specs: Dict[int, TensorSpec] = {}
     for node in gm.graph.nodes:
         for spec in collect_specs_from_nodes(
             filter_nodes(itertools.chain([node], node.args, node.kwargs.values())),
@@ -131,11 +134,60 @@ def _check_default_mem_ids(gm: torch.fx.GraphModule):
             do_assertion=False,
             ignore_dynamic_unbound_tensor=False,
         ):
-            mem_id = getattr(spec, "mem_id", None)
-            if mem_id is not None and mem_id != 1:
-                raise ValueError(
-                    "Cannot share mutable buffers if all other tensors are not on the default mem_id of 1"
-                )
+            specs[id(spec)] = spec
+    return list(specs.values())
+
+
+def _check_default_mem_ids(gm: torch.fx.GraphModule):
+    # Device-aware planning gives each device its own arena, which
+    # run_multimethod moves past the shared one.
+    device_mem_ids = {
+        entry.buffer_idx for entry in gm.meta.get("non_const_buffer_device") or []
+    }
+    for spec in _planned_specs(gm):
+        mem_id = getattr(spec, "mem_id", None)
+        if mem_id is not None and mem_id != 1 and mem_id not in device_mem_ids:
+            raise ValueError(
+                "Cannot share mutable buffers if all other tensors are not on the "
+                "default mem_id of 1 or in a device arena"
+            )
+
+
+def _format_devices(devices: Set[Tuple[DeviceType, int]]) -> str:
+    return ", ".join(f"{t.name.lower()}:{i}" for t, i in sorted(devices))
+
+
+def _insert_shared_arena(
+    gm: torch.fx.GraphModule, size: int, device: Tuple[DeviceType, int]
+) -> None:
+    """Make mem_id 2 of gm the shared arena, on device.
+
+    Every method must find the shared arena at the same mem_id, so the device
+    arenas that device-aware planning put at mem_id 2 and above move up by one.
+    """
+    for spec in _planned_specs(gm):
+        if spec.mem_id is not None and spec.mem_id >= 2:
+            spec.mem_id += 1
+    gm.meta["non_const_buffer_sizes"].insert(2, size)
+    gm.meta["shared_non_const_buffers"] = [2]
+    entries = [
+        (
+            replace(entry, buffer_idx=entry.buffer_idx + 1)
+            if entry.buffer_idx >= 2
+            else entry
+        )
+        for entry in gm.meta.get("non_const_buffer_device") or []
+    ]
+    if device[0] != DeviceType.CPU:
+        entries.append(
+            NonConstBufferDevice(
+                buffer_idx=2, device_type=device[0], device_index=device[1]
+            )
+        )
+    if entries:
+        gm.meta["non_const_buffer_device"] = sorted(
+            entries, key=lambda entry: entry.buffer_idx
+        )
 
 
 def _move_memory_meta_to_spec(node: Node) -> None:
@@ -347,27 +399,43 @@ class MemoryPlanningPass(PassBase):
         """Resolve any memory planning done across entry points, called after run is called on all entry points."""
         if self.share_mutable_buffers:
             arena: int = 0
+            shared_specs: List[TensorSpec] = []
+            devices: Set[Tuple[DeviceType, int]] = set()
 
-            # Every spec that shares an fqn is the same tensor! So we give it the same id and offset
+            # Every spec that shares an fqn is the same tensor! So we give it the same offset
             # anywhere it appears.
             for fqn, specs_set in self.state.mutable_buffers.items():
                 specs = list(specs_set)
                 # If the same buffer appears in mutable and maybe mutable then we know it is in fact mutable.
                 if fqn in self.state.maybe_mutable_buffers.keys():
                     specs.extend(self.state.maybe_mutable_buffers[fqn])
+                fqn_devices = {(spec.device, spec.device_index) for spec in specs}
+                if self.enable_non_cpu_memory_planning and len(fqn_devices) > 1:
+                    raise ValueError(
+                        f"Cannot share mutable buffer {fqn}: methods place it on "
+                        f"{_format_devices(fqn_devices)}"
+                    )
+                devices |= fqn_devices
                 for spec in specs:
-                    # Assume a default memory planning placed all activations on 1, place shared state on 2.
-                    spec.mem_id = 2
                     spec.realign(self.alignment)
                     # State is persistent, so the memory never overlaps.
                     spec.mem_offset = arena
                 # They should all be the same size since they are the same tensor, so just bump off the first.
                 arena += specs[0].allocated_memory
+                shared_specs.extend(specs)
+
+            device = (DeviceType.CPU, 0)
+            if self.enable_non_cpu_memory_planning and devices:
+                if len(devices) > 1:
+                    raise ValueError(
+                        "Cannot share mutable buffers on more than one device, "
+                        f"found {_format_devices(devices)}"
+                    )
+                (device,) = devices
 
             for graph_module in self.state.graph_modules:
-                if len(graph_module.meta["non_const_buffer_sizes"]) != 2:
-                    raise ValueError(
-                        "Cannot share mutable state if not using default memory ids"
-                    )
-                graph_module.meta["non_const_buffer_sizes"].append(arena)
-                graph_module.meta["shared_non_const_buffers"] = [2]
+                _insert_shared_arena(graph_module, arena, device)
+            for spec in shared_specs:
+                spec.mem_id = 2
+            # The pass may plan another program next.
+            self.state = _MemoryPlanningState()
