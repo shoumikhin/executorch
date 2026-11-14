@@ -9,7 +9,7 @@
 
 import itertools
 import unittest
-from typing import Any, Callable, cast, List, Optional, Tuple, Type
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Type, Union
 
 import executorch.exir as exir
 
@@ -52,7 +52,7 @@ from executorch.exir.passes import (  # noqa
 )
 from executorch.exir.passes.reinplace import DEFAULT_INPLACEABLE_OPS, reinplace_pass
 from executorch.exir.passes.sym_shape_eval_pass import ConstraintBasedSymShapeEvalPass
-from executorch.exir.schema import DeviceType
+from executorch.exir.schema import DeviceType, Program
 from executorch.exir.tensor import TensorSpec
 from functorch.experimental.control_flow import map as torch_map
 from parameterized import parameterized
@@ -1362,6 +1362,7 @@ class TestMap(unittest.TestCase):
         et_prog = et.executorch_program
         count = 0
         for plan in et_prog.execution_plan:
+            self.assertEqual(plan.shared_non_const_buffers, [2])
             for value in plan.values:
                 if (
                     hasattr(value.val, "allocation_info")
@@ -1464,6 +1465,45 @@ class TestMap(unittest.TestCase):
             self.assertEqual(v_cache[0].val.allocation_info.memory_id, 2)
             self.assertEqual(v_cache[0].val.allocation_info.memory_offset_low, 256)
             self.assertEqual(v_cache[0].val.allocation_info.memory_offset_high, 0)
+
+    def _export_stateful_methods(
+        self,
+        memory_planning_pass: Union[MemoryPlanningPass, Dict[str, MemoryPlanningPass]],
+    ) -> Program:
+        eager_module = MultiEntryPointStatefulModel().eval()
+        forward = export(eager_module, eager_module.get_example_inputs())
+        with patch_forward(eager_module, eager_module.get_state):
+            get_state = export(eager_module, ())
+        with patch_forward(eager_module, eager_module.set_state):
+            set_state = export(eager_module, (torch.zeros(2, 2),))
+        edge = to_edge(
+            {"forward": forward, "set_state": set_state, "get_state": get_state},
+            compile_config=EdgeCompileConfig(_check_ir_validity=False),
+        )
+        return edge.to_executorch(
+            ExecutorchBackendConfig(
+                memory_planning_pass=memory_planning_pass,
+                emit_mutable_buffer_names=True,
+                enable_non_cpu_memory_planning=True,
+            )
+        ).executorch_program
+
+    def test_methods_sharing_buffers_need_one_planning_pass(self) -> None:
+        shared = MemoryPlanningPass(share_mutable_buffers=True)
+        program = self._export_stateful_methods(
+            {"forward": shared, "get_state": shared, "set_state": shared}
+        )
+        for plan in program.execution_plan:
+            self.assertEqual(len(plan.non_const_buffer_sizes), 3)
+
+        with self.assertRaisesRegex(ValueError, "one MemoryPlanningPass"):
+            self._export_stateful_methods(
+                {
+                    "forward": MemoryPlanningPass(share_mutable_buffers=True),
+                    "get_state": MemoryPlanningPass(share_mutable_buffers=True),
+                    "set_state": shared,
+                }
+            )
 
 
 class TestDeviceAwareMemoryPlanning(unittest.TestCase):

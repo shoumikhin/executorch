@@ -1753,6 +1753,7 @@ class EdgeProgramManager:
         """
         config = config if config else ExecutorchBackendConfig()
         execution_programs: Dict[str, ExportedProgram] = {}
+        planned_graph_modules: Dict[str, torch.fx.GraphModule] = {}
         for name, program in self._edge_programs.items():
             if config.do_quant_fusion_and_const_prop:
                 if program.graph_signature.backward_signature is not None:
@@ -1831,15 +1832,34 @@ class EdgeProgramManager:
 
             _copy_module(program.graph_module, new_gm)
             execution_programs[name] = program
+            planned_graph_modules[name] = new_gm
         # After running memory planning on all entry points we can run the cross entry point memory planning
         if isinstance(config.memory_planning_pass, dict):
-            for memory_planning_pass in config.memory_planning_pass.values():
+            # A pass that plans several methods resolves them in one call.
+            passes = list(
+                {id(p): p for p in config.memory_planning_pass.values()}.values()
+            )
+            # The runtime shares a marked buffer between every method of the
+            # program, so two passes laying out shared state would overlap.
+            if (
+                sum(bool(getattr(p, "share_mutable_buffers", False)) for p in passes)
+                > 1
+            ):
+                raise ValueError(
+                    "Methods that share mutable buffers must be planned by one "
+                    "MemoryPlanningPass instance"
+                )
+            for memory_planning_pass in passes:
                 if hasattr(memory_planning_pass, "run_multimethod"):
                     memory_planning_pass.run_multimethod()
         else:
             memory_planning_pass = config.memory_planning_pass
             if hasattr(memory_planning_pass, "run_multimethod"):
                 memory_planning_pass.run_multimethod()
+        # run_multimethod updates the planned graph modules after their metadata
+        # was copied above.
+        for name, program in execution_programs.items():
+            program.graph_module.meta.update(planned_graph_modules[name].meta)
 
         et_pm = ExecutorchProgramManager(
             execution_programs,

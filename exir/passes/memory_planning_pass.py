@@ -370,3 +370,4 @@ class MemoryPlanningPass(PassBase):
                         "Cannot share mutable state if not using default memory ids"
                     )
                 graph_module.meta["non_const_buffer_sizes"].append(arena)
+                graph_module.meta["shared_non_const_buffers"] = [2]
