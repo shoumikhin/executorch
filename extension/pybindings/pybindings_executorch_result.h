@@ -10,6 +10,7 @@
 
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -74,6 +75,21 @@ inline const PyTensorDType& python_dtype(
     throw std::runtime_error("Unsupported ExecuTorch dtype");
   }
   return kDTypes[index];
+}
+
+// The dtype that ExecuTorchResult.dtype calls `name`, such as "bfloat16".
+inline std::optional<executorch::aten::ScalarType> scalar_type_from_name(
+    const std::string& name) {
+  using executorch::aten::ScalarType;
+  // The dtype table ends at UInt64, while ATen's ScalarType goes on past it.
+  for (int8_t value = 0; value <= static_cast<int8_t>(ScalarType::UInt64);
+       ++value) {
+    const auto scalar_type = static_cast<ScalarType>(value);
+    if (name == python_dtype(scalar_type).torch_name) {
+      return scalar_type;
+    }
+  }
+  return std::nullopt;
 }
 
 inline executorch::aten::ScalarType scalar_type_from_torch_dtype(
