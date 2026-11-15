@@ -7,11 +7,22 @@
 # pyre-unsafe
 
 import copy
+import os
+import tempfile
 import unittest
 from typing import Any, Dict
+from unittest import mock
 
 import torch
 from executorch.exir import EdgeCompileConfig, ExecutorchBackendConfig
+from executorch.exir._serialize._cord import Cord, FileBackedData
+from executorch.exir._serialize._named_data_store import NamedDataStore
+from executorch.exir._serialize._program import deserialize_pte_binary
+from executorch.exir.backend.backend_details import PreprocessResult
+from executorch.exir.backend.test.backend_with_named_data_map import (
+    BackendWithNamedDataMap,
+    BackendWithNDMPartitioner,
+)
 from executorch.exir.backend.test.op_partitioner_demo import (
     AddMulPartitionerDemo,
     NonDecompTestPartitioner,
@@ -30,6 +41,7 @@ from executorch.exir.program._program import (
 )
 from executorch.exir.tracer import _default_decomposition_table
 from executorch.exir.verification.verifier import EXIREdgeDialectVerifier
+from executorch.extension.export_util.utils import save_pte_program
 
 from executorch.extension.pybindings.portable_lib import (
     _load_for_executorch_from_buffer,
@@ -1072,6 +1084,228 @@ class TestProgramManagers(unittest.TestCase):
         et = edge.to_executorch()
         with self.assertRaises(ValueError):
             _ = et.save("/tmp/test_save.pt")
+
+    def test_save_raises_when_the_write_fails(self):
+        model = TestLinear()
+        et = to_edge(
+            torch.export.export(model, model._get_random_inputs(), strict=True)
+        ).to_executorch()
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                Cord, "write_to_file", side_effect=OSError("disk full")
+            ):
+                with self.assertRaises(OSError):
+                    et.save(os.path.join(directory, "model.pte"))
+
+    def test_save_passes_consume_to_the_write(self):
+        model = TestLinear()
+        et = to_edge(
+            torch.export.export(model, model._get_random_inputs(), strict=True)
+        ).to_executorch()
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(Cord, "write_to_file") as write:
+                et.save(os.path.join(directory, "model.pte"), consume=True)
+        write.assert_called_once_with(mock.ANY, consume=True, keep=set())
+
+    def _program_with_owned_data(self, directory):
+        model = TestLinear()
+        et = to_edge(
+            torch.export.export(model, model._get_random_inputs(), strict=True)
+        ).to_executorch()
+        path = os.path.join(directory, "blob.bin")
+        with open(path, "wb") as f:
+            f.write(b"blob" * 1024)
+        return et, FileBackedData.move_from(path)
+
+    def test_a_save_without_consume_leaves_the_program_whole(self):
+        with tempfile.TemporaryDirectory() as directory:
+            et, owned = self._program_with_owned_data(directory)
+            et._pte_data = Cord(owned)
+            for name in ("first.pte", "second.pte"):
+                et.save(os.path.join(directory, name))
+                with open(os.path.join(directory, name), "rb") as f:
+                    self.assertEqual(b"blob" * 1024, f.read())
+            self.assertEqual(b"blob" * 1024, et.buffer)
+
+    @unittest.skipIf(os.name == "nt", "Windows copies instead of moving")
+    def test_consume_moves_an_owned_buffer_into_the_pte(self):
+        with tempfile.TemporaryDirectory() as directory:
+            et, owned = self._program_with_owned_data(directory)
+            et._pte_data = Cord(b"header")
+            et._pte_data.append(owned)
+            et.save(os.path.join(directory, "model.pte"), consume=True)
+            with open(os.path.join(directory, "model.pte"), "rb") as f:
+                self.assertEqual(b"header" + b"blob" * 1024, f.read())
+            self.assertEqual(0, os.path.getsize(owned._path))
+
+    @unittest.skipIf(os.name == "nt", "Windows copies instead of moving")
+    def test_consume_moves_into_the_pte_and_then_the_ptd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            et, pte_data = self._program_with_owned_data(directory)
+            path = os.path.join(directory, "ptd_blob.bin")
+            with open(path, "wb") as f:
+                f.write(b"data" * 1024)
+            ptd_data = FileBackedData.move_from(path)
+            et._pte_data = Cord(pte_data)
+            et._tensor_data = {"data": Cord(ptd_data)}
+            et.save(os.path.join(directory, "model.pte"), consume=True)
+            et.write_tensor_data_to_file(directory, consume=True)
+            for name, data in (("model.pte", b"blob"), ("data.ptd", b"data")):
+                with open(os.path.join(directory, name), "rb") as f:
+                    self.assertEqual(data * 1024, f.read())
+            self.assertEqual(0, os.path.getsize(ptd_data._path))
+
+    @unittest.skipIf(os.name == "nt", "Windows copies instead of moving")
+    def test_a_save_after_a_consuming_save_keeps_the_first_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            et, owned = self._program_with_owned_data(directory)
+            et._pte_data = Cord(owned)
+            path = os.path.join(directory, "model.pte")
+            et.save(path, consume=True)
+            for consume in (False, True):
+                with self.assertRaises(RuntimeError):
+                    et.save(path, consume=consume)
+                with open(path, "rb") as f:
+                    self.assertEqual(b"blob" * 1024, f.read())
+
+    @unittest.skipIf(os.name == "nt", "Windows copies instead of moving")
+    def test_a_ptd_write_after_a_consuming_one_keeps_the_first_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            et, owned = self._program_with_owned_data(directory)
+            et._tensor_data = {"data": Cord(owned)}
+            et.write_tensor_data_to_file(directory, consume=True)
+            with self.assertRaises(RuntimeError):
+                et.write_tensor_data_to_file(directory)
+            with open(os.path.join(directory, "data.ptd"), "rb") as f:
+                self.assertEqual(b"blob" * 1024, f.read())
+
+    @unittest.skipIf(os.name == "nt", "Windows copies instead of moving")
+    def test_save_pte_program_after_a_consuming_save_keeps_the_first_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            et, owned = self._program_with_owned_data(directory)
+            et._pte_data = Cord(owned)
+            path = os.path.join(directory, "model.pte")
+            et.save(path, consume=True)
+            with self.assertRaises(RuntimeError):
+                save_pte_program(et, path)
+            with open(path, "rb") as f:
+                self.assertEqual(b"blob" * 1024, f.read())
+
+    def _save_backend_data_with_consume(self, directory, payload, external_tag):
+        class Sin(torch.nn.Module):
+            def forward(self, x):
+                return torch.sin(x)
+
+        owned = []
+
+        def preprocess(edge_program, compile_specs):
+            path = os.path.join(directory, "payload.bin")
+            with open(path, "wb") as f:
+                f.write(payload)
+            owned.append(FileBackedData.move_from(path))
+            store = NamedDataStore()
+            store.add_named_data("payload", owned[-1], external_tag=external_tag)
+            return PreprocessResult(
+                processed_bytes=b"",
+                debug_handle_map={},
+                data_store_output=store.get_named_data_store_output(),
+            )
+
+        with mock.patch.object(
+            BackendWithNamedDataMap, "preprocess", staticmethod(preprocess)
+        ):
+            et = to_edge_transform_and_lower(
+                torch.export.export(Sin(), (torch.randn(4),), strict=True),
+                partitioner=[BackendWithNDMPartitioner()],
+            ).to_executorch()
+        et.save(os.path.join(directory, "model.pte"), consume=True)
+        et.write_tensor_data_to_file(directory, consume=True)
+        return owned
+
+    @unittest.skipIf(os.name == "nt", "Windows copies instead of moving")
+    def test_consume_moves_backend_data_through_real_lowering(self):
+        payload = bytes(range(256)) * 64
+        for external_tag in (None, "model"):
+            with self.subTest(external_tag=external_tag):
+                with tempfile.TemporaryDirectory() as directory:
+                    owned = self._save_backend_data_with_consume(
+                        directory, payload, external_tag
+                    )
+                    self.assertEqual([0], [os.path.getsize(d._path) for d in owned])
+                    with open(os.path.join(directory, "model.pte"), "rb") as f:
+                        pte = deserialize_pte_binary(f.read())
+                    if external_tag is None:
+                        named = pte.named_data
+                        entry = named.pte_data["payload"]
+                        self.assertEqual(
+                            payload, bytes(named.buffers[entry.buffer_index])
+                        )
+                    else:
+                        with open(os.path.join(directory, "model.ptd"), "rb") as f:
+                            self.assertIn(payload, f.read())
+
+    def test_consume_is_keyword_only(self):
+        model = TestLinear()
+        et = to_edge(
+            torch.export.export(model, model._get_random_inputs(), strict=True)
+        ).to_executorch()
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "model.pte")
+            with self.assertRaises(TypeError):
+                et.save(path, True)
+            with self.assertRaises(TypeError):
+                et.write_tensor_data_to_file(directory, True)
+            with open(path, "wb") as f:
+                with self.assertRaises(TypeError):
+                    et.write_to_file(f, True)
+
+    def test_consume_copies_a_buffer_repeated_in_one_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            et, owned = self._program_with_owned_data(directory)
+            et._pte_data = Cord(owned)
+            et._pte_data.append(owned)
+            et.save(os.path.join(directory, "model.pte"), consume=True)
+            with open(os.path.join(directory, "model.pte"), "rb") as f:
+                self.assertEqual(b"blob" * 2048, f.read())
+
+    def test_save_works_with_a_subclass_that_overrides_write_to_file(self):
+        def write_to_file(self, open_file):
+            open_file.write(b"subclass")
+
+        model = TestLinear()
+        et = to_edge(
+            torch.export.export(model, model._get_random_inputs(), strict=True)
+        ).to_executorch()
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                ExecutorchProgramManager, "write_to_file", write_to_file
+            ):
+                et.save(os.path.join(directory, "model.pte"))
+            with open(os.path.join(directory, "model.pte"), "rb") as f:
+                self.assertEqual(b"subclass", f.read())
+
+    def test_consume_copies_a_buffer_shared_by_the_pte_and_a_ptd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            et, shared = self._program_with_owned_data(directory)
+            # What deduplication produces when the .pte and a .ptd hold the same data.
+            et._pte_data = Cord(shared)
+            et._tensor_data = {"data": Cord(shared)}
+            et.save(os.path.join(directory, "model.pte"), consume=True)
+            et.write_tensor_data_to_file(directory, consume=True)
+            for name in ("model.pte", "data.ptd"):
+                with open(os.path.join(directory, name), "rb") as f:
+                    self.assertEqual(b"blob" * 1024, f.read())
+
+    def test_write_tensor_data_passes_consume_to_the_write(self):
+        model = TestLinear()
+        et = to_edge(
+            torch.export.export(model, model._get_random_inputs(), strict=True)
+        ).to_executorch()
+        et._tensor_data = {"data": Cord(b"data")}
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(Cord, "write_to_file") as write:
+                et.write_tensor_data_to_file(directory, consume=True)
+        write.assert_called_once_with(mock.ANY, consume=True, keep=set())
 
     def test__transform_override_verifiers(self):
         """Test that _transform can override verifiers in the exported program."""

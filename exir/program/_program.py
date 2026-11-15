@@ -11,11 +11,22 @@ import io
 import logging
 import os
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence, Set, TextIO, Type, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    TextIO,
+    Type,
+    Union,
+)
 
 import torch
 import torch._export
-from executorch.exir._serialize._cord import Cord
+from executorch.exir._serialize._cord import Cord, FileBackedData
 from executorch.exir._serialize._named_data_store import (
     NamedDataStore,
     NamedDataStoreOutput,
@@ -2021,36 +2032,84 @@ class ExecutorchProgramManager:
             raise RuntimeError("ETRecord was not generated")
         return self._etrecord
 
-    def write_to_file(self, open_file: io.BufferedIOBase) -> None:
+    def write_to_file(
+        self, open_file: io.BufferedIOBase, *, consume: bool = False
+    ) -> None:
         """
         Writes the serialized ExecuTorch binary to the file at `open_file`. Prefer to use this over
         `buffer`, as it writes to file without copying into a contiguous block of memory first,
         reducing the peak memory usage.
-        """
-        self._pte_data.write_to_file(open_file)
 
-    def write_tensor_data_to_file(self, outdir) -> None:
+        With `consume`, data the program keeps in files it owns, such as large delegate
+        payloads, is moved into `open_file` instead of copied, so it is on disk only once.
+        Afterwards neither this program nor the lowered program it came from, which
+        shares that data, can be written, saved or read through `buffer` again. Where the
+        move isn't possible (see `FileBackedData`), the data is copied and the program
+        stays usable. If the write fails, the data already moved is only in `open_file`,
+        and notes on the error say where. After a consuming write, `open_file` holds the
+        only copy of the moved data, so it must not be opened for writing again: opening
+        it with "wb" empties it before this method can check anything. `save` checks
+        before it opens its output.
         """
-        Writes the serialized ExecuTorch data files to the directory at `outdir`.
+        self._check_file_backed_data([self._pte_data])
+        self._pte_data.write_to_file(
+            open_file, consume=consume, keep=self._shared_file_backed_data()
+        )
+
+    def write_tensor_data_to_file(self, outdir, *, consume: bool = False) -> None:
+        """
+        Writes the serialized ExecuTorch data files to the directory at `outdir`. `consume`
+        works as in `write_to_file`.
         """
         assert self._tensor_data is not None
+        self._check_file_backed_data(self._tensor_data.values())
+        keep = self._shared_file_backed_data()
         for filename, cord in self._tensor_data.items():
             if not filename.endswith(".ptd"):
                 filename += ".ptd"
             with open(os.path.join(outdir, f"{filename}"), "wb") as f:
                 logging.info(f"Writing data file to {filename}")
-                cord.write_to_file(f)
+                cord.write_to_file(f, consume=consume, keep=keep)
 
-    def save(self, path: str) -> None:
+    def _check_file_backed_data(self, cords: Iterable[Cord]) -> None:
+        # After a consuming write an earlier output may hold the only copy of the data.
+        # save and write_tensor_data_to_file call this before they open their output with
+        # "wb"; write_to_file's caller has already opened its file, so there it can only
+        # stop the write.
+        for cord in cords:
+            for data in cord.file_backed():
+                data.check()
+
+    def _shared_file_backed_data(self) -> Set[FileBackedData]:
+        # Deduplication can put one buffer in the .pte and in .ptd files, and a write
+        # can't know whether it is the last one to need it, so such a buffer is copied.
+        seen: Set[FileBackedData] = set()
+        shared: Set[FileBackedData] = set()
+        for cord in [self._pte_data, *(self._tensor_data or {}).values()]:
+            for data in cord.file_backed():
+                if data in seen:
+                    shared.add(data)
+                else:
+                    seen.add(data)
+        return shared
+
+    def save(self, path: str, *, consume: bool = False) -> None:
         """
-        Saves the serialized ExecuTorch binary to the file at `path`.
+        Saves the serialized ExecuTorch binary to the file at `path`. `consume` works as in
+        `write_to_file`.
         """
         if path[-4:] != ".pte":
             logging.error(f"Path {path} does not end with .pte")
             raise ValueError(f"Path {path} does not end with .pte")
         try:
+            self._check_file_backed_data([self._pte_data])
             with open(path, "wb") as file:
-                self.write_to_file(file)
+                # Without `consume`, a subclass's own write_to_file still works.
+                if consume:
+                    self.write_to_file(file, consume=True)
+                else:
+                    self.write_to_file(file)
                 logging.info(f"Saved exported program to {path}")
         except Exception as e:
             logging.error(f"Error while saving to {path}: {e}")
+            raise
