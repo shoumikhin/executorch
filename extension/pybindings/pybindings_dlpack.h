@@ -31,6 +31,11 @@ enum DataTypeCode : uint8_t {
   Complex = 5,
   BFloat = 4,
   Bool = 6,
+  // Since DLPack 1.1.
+  Float8_e4m3fn = 10,
+  Float8_e4m3fnuz = 11,
+  Float8_e5m2 = 12,
+  Float8_e5m2fnuz = 13,
 };
 
 struct Device {
@@ -64,6 +69,10 @@ struct Version {
   uint32_t major;
   uint32_t minor;
 };
+
+// The version these bindings export and ask producers for: 1.1 added the
+// float8 codes.
+constexpr Version kVersion{1, 1};
 
 // DLPack 1.0 capsules carry this struct, named "dltensor_versioned".
 struct ManagedTensorVersioned {
