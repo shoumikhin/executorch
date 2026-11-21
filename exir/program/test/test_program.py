@@ -6,8 +6,12 @@
 
 # pyre-unsafe
 
+import contextlib
 import copy
+import errno
 import os
+import stat
+import sys
 import tempfile
 import unittest
 from typing import Any, Dict
@@ -15,7 +19,13 @@ from unittest import mock
 
 import torch
 from executorch.exir import EdgeCompileConfig, ExecutorchBackendConfig
-from executorch.exir._serialize._cord import Cord
+from executorch.exir._serialize._cord import Cord, FileBackedData
+from executorch.exir._serialize._named_data_store import NamedDataStore
+from executorch.exir.backend.backend_details import PreprocessResult
+from executorch.exir.backend.test.backend_with_named_data_map import (
+    BackendWithNamedDataMap,
+    BackendWithNDMPartitioner,
+)
 from executorch.exir.backend.test.op_partitioner_demo import (
     AddMulPartitionerDemo,
     NonDecompTestPartitioner,
@@ -1257,6 +1267,8 @@ class TestProgramManagers(unittest.TestCase):
             with open(path, "rb") as f:
                 self.assertEqual(b"program", f.read())
             self.assertEqual(directory, legacy.outdir)
+            with self.assertRaises(TypeError):
+                save_pte_program(Legacy(), "model", directory, consume=True)
 
     def test_save_pte_program_writes_the_data_files_and_raises_on_failure(self):
         model = TestLinear()
@@ -1279,6 +1291,316 @@ class TestProgramManagers(unittest.TestCase):
                 ):
                     with self.assertRaises(OSError):
                         save_pte_program(et, path, directory)
+
+    def _owned(self, directory, name="data"):
+        path = os.path.join(directory, name)
+        with open(path, "wb") as f:
+            f.write(name.encode() * 1024)
+        return FileBackedData.move_from(path)
+
+    def _program(self, *pte_buffers, **ptd_buffers):
+        model = TestLinear()
+        et = to_edge(
+            torch.export.export(model, model._get_random_inputs(), strict=True)
+        ).to_executorch()
+        et._pte_data = Cord(b"header")
+        for buffer in pte_buffers:
+            et._pte_data.append(buffer)
+        et._tensor_data = {name: Cord(data) for name, data in ptd_buffers.items()}
+        return et
+
+    def _read(self, path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def _leftovers(self, directory):
+        return [name for name in os.listdir(directory) if name.endswith(".partial")]
+
+    def _lower_with_owned_data(self, directory, payload, external_tag):
+        class Sin(torch.nn.Module):
+            def forward(self, x):
+                return torch.sin(x)
+
+        owned = []
+
+        def preprocess(edge_program, compile_specs):
+            path = os.path.join(directory, "payload.bin")
+            with open(path, "wb") as f:
+                f.write(payload)
+            owned.append(FileBackedData.move_from(path))
+            store = NamedDataStore()
+            store.add_named_data("payload", owned[-1], external_tag=external_tag)
+            return PreprocessResult(
+                processed_bytes=b"",
+                debug_handle_map={},
+                data_store_output=store.get_named_data_store_output(),
+            )
+
+        with mock.patch.object(
+            BackendWithNamedDataMap, "preprocess", staticmethod(preprocess)
+        ):
+            edge = to_edge_transform_and_lower(
+                torch.export.export(Sin(), (torch.randn(4),), strict=True),
+                partitioner=[BackendWithNDMPartitioner()],
+            )
+        return edge, owned
+
+    def test_consume_moves_backend_data_through_real_lowering(self):
+        payload = bytes(range(256)) * 64
+        for external_tag in (None, "model"):
+            for deep_copy in (False, True):
+                with self.subTest(
+                    external_tag=external_tag, deep_copy=deep_copy
+                ), tempfile.TemporaryDirectory() as directory:
+                    edge, owned = self._lower_with_owned_data(
+                        directory, payload, external_tag
+                    )
+                    # A program made from a deep copy must still move the data.
+                    et = (copy.deepcopy(edge) if deep_copy else edge).to_executorch()
+                    outputs = {}
+                    for consume in (False, True):
+                        out = os.path.join(directory, str(consume))
+                        os.mkdir(out)
+                        with mock.patch.object(
+                            FileBackedData, "_MOVE_CHUNK_SIZE", 4096
+                        ):
+                            save_pte_program(et, "model", out, consume=consume)
+                        outputs[consume] = {
+                            name: self._read(os.path.join(out, name))
+                            for name in os.listdir(out)
+                        }
+                    self.assertEqual(outputs[False], outputs[True])
+                    self.assertIn(payload, b"".join(outputs[False].values()))
+                    self.assertEqual([0], [os.path.getsize(d.path) for d in owned])
+
+    def test_consume_replaces_an_existing_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._owned(directory)
+            path = os.path.join(directory, "model.pte")
+            for name in ("model.pte", "model.pte.partial"):
+                with open(os.path.join(directory, name), "wb") as f:
+                    f.write(b"old")
+            os.chmod(path, 0o600)
+            mode = os.stat(path).st_mode
+            with self.assertNoLogs(level="WARNING"):
+                self._program(data).save(path, consume=True)
+            self.assertEqual(mode, os.stat(path).st_mode)
+            self.assertEqual(b"header" + b"data" * 1024, self._read(path))
+            self.assertEqual(0, os.path.getsize(data.path))
+            self.assertEqual(["model.pte.partial"], self._leftovers(directory))
+
+    def test_consume_does_not_replace_an_output_created_during_the_move(self):
+        move_to = FileBackedData._move_to
+
+        def create_output_then_move(data, outfile, offset):
+            with open(path, "wb") as f:
+                f.write(b"other")
+            return move_to(data, outfile, offset)
+
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._owned(directory)
+            path = os.path.join(directory, "model.pte")
+            with mock.patch.object(FileBackedData, "_move_to", create_output_then_move):
+                with self.assertRaises(FileExistsError) as raised:
+                    self._program(data).save(path, consume=True)
+            self.assertEqual(b"other", self._read(path))
+            (temp,) = self._leftovers(directory)
+            temp = os.path.join(directory, temp)
+            self.assertIn(temp, "".join(raised.exception.__notes__))
+            self.assertEqual(b"header" + b"data" * 1024, self._read(temp))
+
+    def test_a_note_names_the_output_once_it_is_in_place(self):
+        def interrupted_link(temp, path):
+            os.replace(temp, path)
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "model.pte")
+            with mock.patch.object(os, "link", interrupted_link):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    self._program(self._owned(directory)).save(path, consume=True)
+            self.assertEqual(
+                [f"{path} holds the only copy of the data moved so far."],
+                raised.exception.__notes__,
+            )
+            self.assertEqual(b"header" + b"data" * 1024, self._read(path))
+
+    def test_consume_renames_only_where_there_are_no_hard_links(self):
+        for error in (errno.EPERM, errno.EIO):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "model.pte")
+                et = self._program(self._owned(directory))
+                with mock.patch.object(os, "link", side_effect=OSError(error, "")):
+                    if error == errno.EPERM:
+                        et.save(path, consume=True)
+                    else:
+                        with self.assertRaises(OSError):
+                            et.save(path, consume=True)
+                self.assertEqual(error == errno.EPERM, os.path.exists(path))
+
+    @unittest.skipIf(sys.platform == "win32", "directories are not synced there")
+    def test_a_consuming_save_syncs_before_each_step_a_crash_could_undo(self):
+        events = []
+        link, move_to = os.link, FileBackedData._move_to
+
+        def sync(fd):
+            events.append("sync dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "sync")
+
+        def record(event, function):
+            def wrapper(*args):
+                events.append(event)
+                return function(*args)
+
+            return wrapper
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "executorch.exir.program._program._sync", sync
+        ), mock.patch.object(os, "link", record("link", link)), mock.patch.object(
+            FileBackedData, "_move_to", record("move", move_to)
+        ):
+            self._program(self._owned(directory)).save(
+                os.path.join(directory, "model.pte"), consume=True
+            )
+        self.assertEqual(["sync dir", "move", "sync", "link", "sync dir"], events)
+
+    @unittest.skipIf(sys.platform == "win32", "directories are not synced there")
+    def test_a_directory_that_fails_to_sync_stops_the_save_before_data_moves(self):
+        for error in (errno.EIO, errno.EINVAL):
+
+            def sync(fd, error=error):
+                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                    raise OSError(error, "")
+
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                data = self._owned(directory)
+                path = os.path.join(directory, "model.pte")
+                with mock.patch("executorch.exir.program._program._sync", sync):
+                    if error == errno.EIO:
+                        with self.assertRaises(OSError):
+                            self._program(data).save(path, consume=True)
+                        self.assertEqual(b"data" * 1024, data.to_bytes())
+                    else:
+                        self._program(data).save(path, consume=True)
+                        self.assertEqual(b"header" + b"data" * 1024, self._read(path))
+
+    def test_a_consuming_save_that_fails_before_moving_leaves_nothing_behind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._owned(directory)
+            path = os.path.join(directory, "model.pte")
+            with mock.patch.object(
+                FileBackedData, "_move_to", side_effect=OSError("disk full")
+            ):
+                with self.assertRaises(OSError) as raised:
+                    self._program(data).save(path, consume=True)
+            self.assertFalse(getattr(raised.exception, "__notes__", None))
+            self.assertEqual([], self._leftovers(directory))
+            self.assertEqual(b"data" * 1024, data.to_bytes())
+
+    def test_writing_again_after_a_consuming_write_keeps_the_first_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pte = os.path.join(directory, "model.pte")
+            ptd = os.path.join(directory, "data.ptd")
+            et = self._program(
+                self._owned(directory, "a"), data=self._owned(directory, "b")
+            )
+            et.save(pte, consume=True)
+            et.write_tensor_data_to_file(directory, consume=True)
+            outputs = {pte: self._read(pte), ptd: self._read(ptd)}
+            for consume in (False, True):
+                with self.assertRaises(RuntimeError):
+                    et.save(pte, consume=consume)
+                with self.assertRaises(RuntimeError):
+                    et.write_tensor_data_to_file(directory, consume=consume)
+            self.assertEqual(outputs, {pte: self._read(pte), ptd: self._read(ptd)})
+
+    def test_writing_over_the_data_file_raises(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._owned(directory)
+            et = self._program(data, data=data)
+            os.link(data.path, os.path.join(directory, "model.pte"))
+            os.link(data.path, os.path.join(directory, "data.ptd"))
+            for consume in (False, True):
+                with self.assertRaises(ValueError):
+                    et.save(os.path.join(directory, "model.pte"), consume=consume)
+                with self.assertRaises(ValueError):
+                    et.write_tensor_data_to_file(directory, consume=consume)
+            self.assertEqual(b"data" * 1024, data.to_bytes())
+
+    def test_consume_copies_data_used_more_than_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shared = self._owned(directory, "shared")
+            twice = self._owned(directory, "twice")
+            et = self._program(shared, twice, twice, data=shared)
+            with self.assertLogs(level="WARNING") as logs:
+                et.save(os.path.join(directory, "model.pte"), consume=True)
+                et.write_tensor_data_to_file(directory, consume=True)
+            self.assertIn("Copied 2 of 2 file-backed buffers", logs.output[0])
+            self.assertIn("Copied 1 of 1 file-backed buffers", logs.output[1])
+            self.assertEqual(
+                b"header" + b"shared" * 1024 + b"twice" * 2048,
+                self._read(os.path.join(directory, "model.pte")),
+            )
+            self.assertEqual(b"shared" * 1024, shared.to_bytes())
+            self.assertEqual(b"twice" * 1024, twice.to_bytes())
+
+    @unittest.skipIf(sys.platform == "win32", "needs symlinks and file modes")
+    def test_consume_copies_into_the_output_when_a_move_would_lose_something(self):
+        def symlink(stack, directory, path, data):
+            target = os.path.join(directory, "target.pte")
+            os.replace(path, target)
+            os.symlink(target, path)
+
+        def output_with_another_name(stack, directory, path, data):
+            os.link(path, os.path.join(directory, "other.pte"))
+
+        def read_only_directory(stack, directory, path, data):
+            os.chmod(directory, 0o555)
+            stack.callback(os.chmod, directory, 0o755)
+
+        def data_with_another_name(stack, directory, path, data):
+            os.link(data.path, os.path.join(directory, "other"))
+
+        def data_on_another_file_system(stack, directory, path, data):
+            real = FileBackedData.stat
+
+            def elsewhere(data):
+                result = real(data)
+                return os.stat_result((*result[:2], result.st_dev + 1, *result[3:]))
+
+            stack.enter_context(mock.patch.object(FileBackedData, "stat", elsewhere))
+
+        cases = [symlink, output_with_another_name, data_with_another_name]
+        cases.append(data_on_another_file_system)
+        if os.geteuid() != 0:
+            cases.append(read_only_directory)
+        for case in cases:
+            with self.subTest(case.__name__), tempfile.TemporaryDirectory() as (
+                directory
+            ), contextlib.ExitStack() as stack:
+                data = self._owned(directory)
+                path = os.path.join(directory, "model.pte")
+                open(path, "wb").close()
+                case(stack, directory, path, data)
+                before = os.stat(path)
+                with self.assertLogs(level="WARNING"):
+                    self._program(data).save(path, consume=True)
+                self.assertTrue(os.path.samestat(before, os.stat(path)))
+                self.assertEqual(b"header" + b"data" * 1024, self._read(path))
+                self.assertEqual(b"data" * 1024, data.to_bytes())
+
+    @unittest.skipIf(
+        sys.platform == "win32" or os.geteuid() == 0, "needs file modes, not root"
+    )
+    def test_consume_does_not_replace_a_read_only_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._owned(directory)
+            path = os.path.join(directory, "model.pte")
+            open(path, "wb").close()
+            os.chmod(path, 0o444)
+            with self.assertRaises(PermissionError):
+                self._program(data).save(path, consume=True)
+            self.assertEqual(b"", self._read(path))
+            self.assertEqual(b"data" * 1024, data.to_bytes())
 
     def test__transform_override_verifiers(self):
         """Test that _transform can override verifiers in the exported program."""
